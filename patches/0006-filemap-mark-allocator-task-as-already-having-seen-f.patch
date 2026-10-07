@@ -1,0 +1,32 @@
+From 431cb67747f35ea8b84faca5dc33f03bd1b4c34b Mon Sep 17 00:00:00 2001
+From: Marcell Matthias Haritopoulos <marcell.haritopoulos@student.tugraz.at>
+Date: Sun, 21 Dec 2025 05:23:32 +0100
+Subject: [PATCH 06/13] filemap: mark allocator task as already having seen
+ folio
+
+The task that caused a folio to be allocated and read ahead already had
+some penalty due to actual I/O going on. Spare it from synthetic
+penalties by directly marking the allocated page as already seen in the
+bitmap.
+---
+ mm/filemap.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/mm/filemap.c b/mm/filemap.c
+index d9ab3e0caf31..777470346861 100644
+--- a/mm/filemap.c
++++ b/mm/filemap.c
+@@ -1143,6 +1143,10 @@ int filemap_add_folio(struct address_space *mapping, struct folio *folio,
+ 			mod_node_page_state(folio_pgdat(folio),
+ 					    NR_KERNEL_FILE_PAGES,
+ 					    folio_nr_pages(folio));
++
++#ifdef CONFIG_PAGE_CACHE_ISOLATION
++		filemap_set_accessed_bits(mapping, current->mm, index, folio_nr_pages(folio));
++#endif /* CONFIG_PAGE_CACHE_ISOLATION */
+ 	}
+ 	return ret;
+ }
+-- 
+2.55.0
+

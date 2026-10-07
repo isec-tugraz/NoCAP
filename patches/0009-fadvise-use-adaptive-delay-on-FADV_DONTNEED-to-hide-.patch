@@ -1,0 +1,166 @@
+From 1afdd208789e2ccea35c725ed5e0a18874f9f0ae Mon Sep 17 00:00:00 2001
+From: Marcell Matthias Haritopoulos <marcell.haritopoulos@student.tugraz.at>
+Date: Mon, 29 Dec 2025 17:14:03 +0100
+Subject: [PATCH 09/13] fadvise: use adaptive delay on FADV_DONTNEED to hide
+ page cache state
+
+---
+ include/linux/mm.h |  2 ++
+ init/main.c        |  1 +
+ mm/Kconfig         | 19 +++++++++++++++
+ mm/fadvise.c       | 61 ++++++++++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 83 insertions(+)
+
+diff --git a/include/linux/mm.h b/include/linux/mm.h
+index 7c79b3369b82..5b5c842ad40f 100644
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@ -4336,4 +4336,6 @@ static inline bool snapshot_page_is_faithful(const struct page_snapshot *ps)
+ 
+ void snapshot_page(struct page_snapshot *ps, const struct page *page);
+ 
++extern void __init fadvise_init(void);
++
+ #endif /* _LINUX_MM_H */
+diff --git a/init/main.c b/init/main.c
+index 07a3116811c5..40f5e1f834e2 100644
+--- a/init/main.c
++++ b/init/main.c
+@@ -1095,6 +1095,7 @@ void start_kernel(void)
+ 	signals_init();
+ 	seq_file_init();
+ 	proc_root_init();
++	fadvise_init();
+ 	nsfs_init();
+ 	pidfs_init();
+ 	cpuset_init();
+diff --git a/mm/Kconfig b/mm/Kconfig
+index 5be03abc6c38..0aa4e5c09f51 100644
+--- a/mm/Kconfig
++++ b/mm/Kconfig
+@@ -1407,6 +1407,25 @@ config PAGE_CACHE_ISOLATION_MIMIC_IO
+ 	  the isolation and will make the isolation less noticable (for an
+ 	  attacker and the user)
+ 
++config PAGE_CACHE_ISOLATION_DELAYED_FADV_DONTNEED
++	bool "delay FADV_DONTNEED to hide page cache state"
++	default y
++	depends on PAGE_CACHE_ISOLATION
++	help
++	  Enables an adaptive constant time delay on
++	  fadvise(..., ..., ..., FADV_DONTNEED) that depends on the size of the
++	  mapping to drop from the page cache. This prevents leaking the state
++	  of pages in the page cache using flush+flush by maintaining a constant
++	  time for smaller operations (larger operations have a lot of
++	  side-channel noise).
++
++	  The constant time delay depends on the amount of pages that are affected
++	  by the request and is approximated by a linear curve:
++		  const_time = vm.dontneed_wait_constant + nr_pages * vm.dontneed_wait_factor
++	  Specifying both the constant and wait factor to 0 disables the constant
++	  time delay at runtime.
++
++
+ endif # PAGE_CACHE_ISOLATION
+ 
+ source "mm/damon/Kconfig"
+diff --git a/mm/fadvise.c b/mm/fadvise.c
+index 588fe76c5a14..436c9db7ef52 100644
+--- a/mm/fadvise.c
++++ b/mm/fadvise.c
+@@ -23,6 +23,11 @@
+ 
+ #include "internal.h"
+ 
++#ifdef CONFIG_PAGE_CACHE_ISOLATION_DELAYED_FADV_DONTNEED
++static unsigned int dontneed_wait_factor_centicycles = 40000;
++static unsigned int dontneed_wait_constant_centicycles = 100000;
++#endif /* CONFIG_PAGE_CACHE_ISOLATION_DELAYED_FADV_DONTNEED */
++
+ /*
+  * POSIX_FADV_WILLNEED could set PG_Referenced, and POSIX_FADV_NOREUSE could
+  * deactivate the pages and clear PG_Referenced.
+@@ -37,6 +42,10 @@ int generic_fadvise(struct file *file, loff_t offset, loff_t len, int advice)
+ 	pgoff_t start_index;
+ 	pgoff_t end_index;
+ 	unsigned long nrpages;
++#ifdef CONFIG_PAGE_CACHE_ISOLATION_DELAYED_FADV_DONTNEED
++	u64 start_tsc;
++	u64 delay_tsc;
++#endif /* CONFIG_PAGE_CACHE_ISOLATION_DELAYED_FADV_DONTNEED */
+ 
+ 	inode = file_inode(file);
+ 	if (S_ISFIFO(inode->i_mode))
+@@ -111,6 +120,10 @@ int generic_fadvise(struct file *file, loff_t offset, loff_t len, int advice)
+ 		spin_unlock(&file->f_lock);
+ 		break;
+ 	case POSIX_FADV_DONTNEED:
++#ifdef CONFIG_PAGE_CACHE_ISOLATION_DELAYED_FADV_DONTNEED
++		start_tsc = rdtsc();
++#endif /* CONFIG_PAGE_CACHE_ISOLATION_DELAYED_FADV_DONTNEED */
++
+ 		__filemap_fdatawrite_range(mapping, offset, endbyte,
+ 					   WB_SYNC_NONE);
+ 
+@@ -168,6 +181,23 @@ int generic_fadvise(struct file *file, loff_t offset, loff_t len, int advice)
+ 				invalidate_mapping_pages(mapping, start_index,
+ 						end_index);
+ 			}
++
++#ifdef CONFIG_PAGE_CACHE_ISOLATION_DELAYED_FADV_DONTNEED
++			unsigned long real_end_index;
++
++			// len may also be set to 0, at which point the end_index
++			// is set to LLONG_MAX, or userspace may specify a greater length
++			// than the file actually is!
++			// To combat this, we need to figure out the actual size and
++			// sleep for that long. Delaying for LLONG_MAX is quite a while.
++			real_end_index = (inode_get_bytes(file->f_inode) >> PAGE_SHIFT) + 1;
++			real_end_index = min(real_end_index, end_index);
++
++			delay_tsc = ((real_end_index - start_index) * (u64)dontneed_wait_factor_centicycles) + (u64)dontneed_wait_constant_centicycles;
++			delay_tsc = delay_tsc / 100;
++			while ((start_tsc + delay_tsc) > rdtsc())
++				;
++#endif /* CONFIG_PAGE_CACHE_ISOLATION_DELAYED_FADV_DONTNEED */
+ 		}
+ 		break;
+ 	default:
+@@ -223,3 +253,34 @@ COMPAT_SYSCALL_DEFINE6(fadvise64_64, int, fd, compat_arg_u64_dual(offset),
+ 
+ #endif
+ #endif
++
++
++#ifdef CONFIG_PAGE_CACHE_ISOLATION_DELAYED_FADV_DONTNEED
++static const struct ctl_table fadvise_systl_table[] = {
++	{
++		.procname	= "dontneed_wait_factor_centicycles",
++		.data		= &dontneed_wait_factor_centicycles,
++		.maxlen		= sizeof(dontneed_wait_factor_centicycles),
++		.mode		= 0600,
++		.proc_handler	= proc_douintvec,
++		.extra1		= SYSCTL_ZERO,
++	},
++	{
++		.procname	= "dontneed_wait_constant_centicycles",
++		.data		= &dontneed_wait_constant_centicycles,
++		.maxlen		= sizeof(dontneed_wait_constant_centicycles),
++		.mode		= 0600,
++		.proc_handler	= proc_douintvec,
++		.extra1		= SYSCTL_ZERO,
++	},
++};
++
++void __init fadvise_init(void)
++{
++	register_sysctl_init("vm", fadvise_systl_table);
++}
++#else
++void __init fadvise_init(void)
++{
++}
++#endif /* CONFIG_PAGE_CACHE_ISOLATION_DELAYED_FADV_DONTNEED */
+-- 
+2.55.0
+

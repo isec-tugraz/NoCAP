@@ -1,0 +1,1029 @@
+From f179a2c524e69fec5e2b7ee4b05ca950c84cb48e Mon Sep 17 00:00:00 2001
+From: Marcell Matthias Haritopoulos <marcell.haritopoulos@student.tugraz.at>
+Date: Sat, 3 Jan 2026 00:01:48 +0100
+Subject: [PATCH 10/13] filemap: readahead: add page cache isolation for faults
+ (broken async)
+
+Implement sync and async I/O mimicking. While sync works (albeit pretty
+slow with the currentyl created/destroyed temp fake mappings, but async
+is very prone to crashing.
+async does for some reason work with a shared fake address_space
+instance. While it does not cleanly isolate the state that way, include
+it for now to move on with the impl, and break it up later (or keep
+async readahead disabled).
+
+filemap: skip non-accessed folios in folios on vm op map_pages
+---
+ fs/inode.c              |  17 ++
+ include/linux/fs.h      |   3 +
+ include/linux/pagemap.h |  10 +
+ mm/filemap.c            | 577 ++++++++++++++++++++++++++++++++++++----
+ mm/readahead.c          | 128 ++++++---
+ 5 files changed, 647 insertions(+), 88 deletions(-)
+
+diff --git a/fs/inode.c b/fs/inode.c
+index 5c873bb7f65b..81b5d69fbfda 100644
+--- a/fs/inode.c
++++ b/fs/inode.c
+@@ -391,6 +391,9 @@ void __destroy_inode(struct inode *inode)
+ 		posix_acl_release(inode->i_acl);
+ 	if (inode->i_default_acl && !is_uncached_acl(inode->i_default_acl))
+ 		posix_acl_release(inode->i_default_acl);
++#endif
++#ifdef CONFIG_PAGE_CACHE_ISOLATION_MIMIC_IO
++	address_space_free_mimic_mapping(&inode->i_mapping->i_mm_async_mimic_mapping);
+ #endif
+ 	this_cpu_dec(nr_inodes);
+ }
+@@ -494,6 +497,7 @@ static void __address_space_init_once(struct address_space *mapping)
+ 	xa_init_flags(&mapping->i_pages, XA_FLAGS_LOCK_IRQ | XA_FLAGS_ACCOUNT);
+ #ifdef CONFIG_PAGE_CACHE_ISOLATION
+ 	mt_init_flags(&mapping->i_mm_access_bits, MT_FLAGS_LOCK_IRQ);
++	mapping->i_mm_async_mimic_mapping = NULL;
+ #endif /* CONFIG_PAGE_CACHE_ISOLATION */
+ 	init_rwsem(&mapping->i_mmap_rwsem);
+ 	INIT_LIST_HEAD(&mapping->i_private_list);
+@@ -518,6 +522,19 @@ static void address_space_free(struct address_space *mapping) {
+ 	}
+ 	mtree_destroy(&mapping->i_mm_access_bits);
+ }
++#ifdef CONFIG_PAGE_CACHE_ISOLATION_MIMIC_IO
++void address_space_free_mimic_mapping(struct address_space **mimic_mapping)
++{
++	if (!*mimic_mapping)
++		return;
++
++	truncate_inode_pages(*mimic_mapping, 0);
++	address_space_free(*mimic_mapping);
++
++	kfree(*mimic_mapping);
++	*mimic_mapping = NULL;
++}
++#endif /* CONFIG_PAGE_CACHE_ISOLATION_MIMIC_IO */
+ #endif /* CONFIG_PAGE_CACHE_ISOLATION */
+ 
+ /*
+diff --git a/include/linux/fs.h b/include/linux/fs.h
+index a57e3d716627..6444a21bafdd 100644
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -526,6 +526,9 @@ struct address_space {
+ 	void *			i_private_data;
+ #ifdef CONFIG_PAGE_CACHE_ISOLATION
+ 	struct maple_tree	i_mm_access_bits;
++#ifdef CONFIG_PAGE_CACHE_ISOLATION_MIMIC_IO
++	struct address_space	*i_mm_async_mimic_mapping;
++#endif /* CONFIG_PAGE_CACHE_ISOLATION_MIMIC_IO */
+ #endif /* CONFIG_PAGE_CACHE_ISOLATION */
+ } __attribute__((aligned(sizeof(long)))) __randomize_layout;
+ 	/*
+diff --git a/include/linux/pagemap.h b/include/linux/pagemap.h
+index 827bfcd8fbe9..1fb518dd5895 100644
+--- a/include/linux/pagemap.h
++++ b/include/linux/pagemap.h
+@@ -1272,6 +1272,14 @@ int filemap_add_folio(struct address_space *mapping, struct folio *folio,
+ #ifdef CONFIG_PAGE_CACHE_ISOLATION
+ int filemap_set_accessed_bits(struct address_space *mapping,
+ 		struct mm_struct *mm, off_t start, off_t len);
++#ifdef CONFIG_PAGE_CACHE_ISOLATION_MIMIC_IO
++void readahead_init_fake_mapping(struct address_space *fake_mapping,
++		struct address_space *mapping);
++void readahead_apply_fake_mapping_pages(struct address_space *fake_mapping,
++		struct address_space *mapping, loff_t start, loff_t end);
++void readahead_finalize_fake_mapping(struct address_space *fake_mapping,
++		struct address_space *mapping);
++#endif /* CONFIG_PAGE_CACHE_ISOLATION_MIMIC_IO */
+ #endif /* CONFIG_PAGE_CACHE_ISOLATION */
+ 
+ 
+@@ -1371,10 +1379,12 @@ int readahead_set_accessed_bits_async(struct kiocb *iocb, struct file *filp,
+ 		pgoff_t last_index, size_t *non_accessed_folios);
+ int readahead_mimic_sync(struct address_space *mapping, struct file *filp,
+ 		unsigned long index, unsigned int count);
++void address_space_free_mimic_mapping(struct address_space **mimic_mapping);
+ 
+ struct access_bits_struct {
+ 	unsigned long mm_token;
+ 	struct xarray bits_arr;
++	struct address_space *mm_sync_mimic_mapping;
+ };
+ #endif /* CONFIG_PAGE_CACHE_ISOLATION */
+ 
+diff --git a/mm/filemap.c b/mm/filemap.c
+index 95ee20e8bf50..dfff2defd2f2 100644
+--- a/mm/filemap.c
++++ b/mm/filemap.c
+@@ -18,6 +18,7 @@
+ #include "linux/maple_tree.h"
+ #include "linux/printk.h"
+ #include "linux/slab.h"
++#include "linux/stddef.h"
+ #include "linux/xarray.h"
+ #include <linux/export.h>
+ #include <linux/compiler.h>
+@@ -169,8 +170,8 @@ static void mapping_clear_accessed_bits(struct address_space *mapping,
+ }
+ 
+ 
+-static int filemap_get_access_bitmask(struct address_space *mapping,
+-		struct mm_struct *mm, struct xarray **out)
++static int filemap_get_access_bits_struct(struct address_space *mapping,
++		struct mm_struct *mm, struct access_bits_struct **out)
+ {
+ 	int ret;
+ 	unsigned long key;
+@@ -192,12 +193,23 @@ static int filemap_get_access_bitmask(struct address_space *mapping,
+ 		xa_init_flags(&access->bits_arr, XA_FLAGS_LOCK_IRQ);
+ 		access->mm_token = (mm ? mm->filemap_token : 0);
+ 
++		struct address_space *fake_mapping = kmalloc(sizeof(*fake_mapping), GFP_KERNEL);
++		if (!fake_mapping) {
++			kfree(access);
++			return -ENOMEM;
++		}
++
++		readahead_init_fake_mapping(fake_mapping, mapping);
++		access->mm_sync_mimic_mapping = fake_mapping;
++
+ 		ret = mtree_insert(&mapping->i_mm_access_bits, key, access, GFP_KERNEL);
+ 		if (ret == -EEXIST) {
++			address_space_free_mimic_mapping(&access->mm_sync_mimic_mapping);
+ 			kfree(access);
+ 			goto retry;
+ 		}
+ 		if (ret) {
++			address_space_free_mimic_mapping(&access->mm_sync_mimic_mapping);
+ 			kfree(access);
+ 			return ret;
+ 		}
+@@ -212,14 +224,47 @@ static int filemap_get_access_bitmask(struct address_space *mapping,
+ 			xa_destroy(&access->bits_arr);
+ 			xa_init(&access->bits_arr);
+ 
++			// Also destroy the mimic mapping
++			address_space_free_mimic_mapping(&access->mm_sync_mimic_mapping);
++			struct address_space *fake_mapping = kmalloc(sizeof(*fake_mapping), GFP_KERNEL);
++			if (!fake_mapping) {
++				return -ENOMEM;
++			}
++			readahead_init_fake_mapping(fake_mapping, mapping);
++			access->mm_sync_mimic_mapping = fake_mapping;
++
+ 			access->mm_token = (mm ? mm->filemap_token : 0);
+ 		}
+ 	}
+ 
++	*out = access;
++	return 0;
++}
++
++static int filemap_get_access_bitmask(struct address_space *mapping,
++		struct mm_struct *mm, struct xarray **out)
++{
++	struct access_bits_struct *access;
++	int err;
++
++	err = filemap_get_access_bits_struct(mapping, mm, &access);
++
+ 	*out = &access->bits_arr;
+ 	return 0;
+ }
+ 
++static int filemap_get_access_sync_mimic_mapping(struct address_space *mapping,
++		struct mm_struct *mm, struct address_space **out)
++{
++	struct access_bits_struct *access;
++	int err;
++
++	err = filemap_get_access_bits_struct(mapping, mm, &access);
++
++	*out = access->mm_sync_mimic_mapping;
++	return 0;
++}
++
+ static int _filemap_set_accessed_bits(struct xarray *bits_arr,
+ 		off_t start, off_t len, size_t *non_accessed_folios)
+ {
+@@ -2620,8 +2665,13 @@ static int filemap_read_folio(struct file *file, filler_t filler,
+ 	error = folio_wait_locked_killable(folio);
+ 	if (error)
+ 		return error;
+-	if (folio_test_uptodate(folio))
++	if (folio_test_uptodate(folio)) {
++#ifdef CONFIG_PAGE_CACHE_ISOLATION
++		if (file && current)
++			filemap_set_accessed_bits(file->f_mapping, current->mm, folio_index(folio), folio_nr_pages(folio));
++#endif /* CONFIG_PAGE_CACHE_ISOLATION */
+ 		return 0;
++	}
+ 	if (file)
+ 		shrink_readahead_size_eio(&file->f_ra);
+ 	return -EIO;
+@@ -2843,6 +2893,200 @@ static int _filemap_test_accessed_bits(struct xarray *bits_arr,
+ 
+ 	return 0;
+ }
++typedef int (*transfer_access_state_waitlock_fn)(struct folio *, void *);
++static int __filemap_transfer_async_accessed_state(struct address_space *mapping,
++		off_t start_idx, off_t end_idx, struct xarray *bits_arr,
++		transfer_access_state_waitlock_fn waitlock_fn,
++		void *waitlock_data)
++{
++	int err;
++
++	if (!mapping->i_mm_async_mimic_mapping)
++		return 0;
++
++	/* Check if there is anything overlapping this range in the fake async mapping */
++	for (size_t i = start_idx; i <= end_idx; i++) {
++		struct folio *folio;
++
++retry:
++		folio = filemap_get_folio(mapping->i_mm_async_mimic_mapping, i);
++		if (IS_ERR(folio)) {
++			if (PTR_ERR(folio) == -ENOENT)
++				continue;
++			else
++				return PTR_ERR(folio);
++		}
++
++		/*
++		 * At this point we actually found a folio that was placed in the simulated async readahead state.
++		 * Now that somebody tried to access it, block the thread until it is uptodate and then set the
++		 * accessed bit accordingly.
++		 * The flag responsible is uptodate - see do_read_cache_folio. locked is only required for _performing_
++		 * operations on the folio.
++		 */
++
++		err = waitlock_fn(folio, waitlock_data);
++		if (err == -EAGAIN)
++			goto retry;
++		else if (err)
++			return err;
++
++		// If the read was not successful but folio is not locked
++		// after an attempted posted readahead, uptodate is not set.
++		// Don't know how to handle it, tho.
++		// TODO
++		if (folio_test_uptodate(folio))
++			_filemap_set_accessed_bits(bits_arr, folio_index(folio), folio_nr_pages(folio), NULL);
++		else
++			WARN_ON_ONCE(1);
++
++		/* get_folio incs the refcount */
++		folio_put(folio);
++	}
++
++	/* Remove the folios - we've transferred the state and do not need to keep hogging the memory */
++	truncate_inode_pages_range(mapping->i_mm_async_mimic_mapping, start_idx, end_idx);
++
++	return 0;
++}
++static int transfer_waitlock_normal(struct folio *folio, void *data)
++{
++	// TODO: do_read_cache_page does read the page syncrhonously itself if it was not cached yet
++	if (folio_test_locked(folio)) {
++		folio_put_wait_locked(folio, TASK_UNINTERRUPTIBLE);
++		/* DROP does not check the bit due to dropping the ref - retry to prevent spurious wakeup */
++		return -EAGAIN;
++	}
++	return 0;
++}
++static int _filemap_transfer_async_accessed_state(struct address_space *mapping,
++		off_t start_idx, off_t end_idx, struct xarray *bits_arr)
++{
++	return __filemap_transfer_async_accessed_state(mapping, start_idx, end_idx,
++			bits_arr, transfer_waitlock_normal, NULL);
++}
++static int filemap_peek_transfer_async_accessed_state(struct address_space *mapping,
++		pgoff_t start_pgoff, pgoff_t end_pgoff)
++{
++	int ret;
++	struct xarray *bits_arr;
++	struct mm_struct *mm;
++
++	if (!mapping->i_mm_async_mimic_mapping)
++		return 0;
++
++	mm = current ? current->mm : NULL;
++
++	ret = filemap_get_access_bitmask(mapping, mm, &bits_arr);
++	if (ret)
++		return ret;
++
++	for (size_t i = start_pgoff; i <= end_pgoff; i++) {
++		struct folio *folio;
++
++		folio = filemap_get_folio(mapping->i_mm_async_mimic_mapping, i);
++		if (IS_ERR(folio)) {
++			if (PTR_ERR(folio) == -ENOENT)
++				continue;
++			else
++				return PTR_ERR(folio);
++		}
++
++		/* Only apply the bitmask if the folio is done, i.e. not locked anymore and uptodate */
++		if (!folio_test_locked(folio) && folio_test_uptodate(folio)) {
++			_filemap_set_accessed_bits(bits_arr, folio_index(folio), folio_nr_pages(folio), NULL);
++			/*
++			 * Only attempt to lock and remove the folio. If we cannot because somebody was quicker
++			 * than us, we'll just carry on instead of locking up the fault handling.
++			 * This means we may double-set bits if we encounter the uptodate folio again,
++			 * but this is better than blocking.
++			 */
++			if (folio_trylock(folio)) {
++				mapping_evict_folio(mapping->i_mm_async_mimic_mapping, folio);
++				folio_unlock(folio);
++			}
++		}
++
++		/* get_folio incs the refcount */
++		folio_put(folio);
++	}
++
++	return 0;
++}
++struct waitlock_fault_data {
++	struct vm_fault *vmf;
++	struct file **fpin;
++};
++static int transfer_waitlock_fault(struct folio *folio, void *userdata)
++{
++	struct waitlock_fault_data *data = userdata;
++
++	/* If the folio is not locked anymore, the "trylock" "succeeded" */
++	if (folio_test_locked(folio)) {
++		*data->fpin = maybe_unlock_mmap_for_io(data->vmf, *data->fpin);
++		folio_put_wait_locked(folio, TASK_UNINTERRUPTIBLE);
++		return -EAGAIN;
++	}
++	return 0;
++}
++static int filemap_transfer_async_accessed_state_fault(struct vm_fault *vmf,
++		struct address_space *mapping, struct folio *folio,
++		struct file **fpin)
++{
++	int ret;
++	off_t start_idx;
++	off_t end_idx;
++	struct xarray *bits_arr;
++
++	/*
++	 * this function has to mimic the lock_folio_maybe_drop_mmap because
++	 * the async readahead, if not completed, does still hold the folio
++	 * lock, which is resolved in there and not before.
++	 */
++
++	if (!mapping->i_mm_async_mimic_mapping)
++		return 0;
++	if (!current)
++		return 0;
++
++	start_idx = folio_index(folio);
++	end_idx = start_idx + folio_nr_pages(folio) - 1;
++
++	ret = filemap_get_access_bitmask(mapping, current->mm, &bits_arr);
++	if (ret)
++		return ret;
++
++	struct waitlock_fault_data waitlock_fault_data  = {
++		.vmf = vmf,
++		.fpin = fpin,
++	};
++	__filemap_transfer_async_accessed_state(mapping, start_idx, end_idx, bits_arr, transfer_waitlock_fault, &waitlock_fault_data);
++
++
++	return 0;
++}
++static int filemap_test_accessed_fault(struct address_space *mapping, off_t off, off_t len)
++{
++	int ret;
++	struct mm_struct *mm;
++	struct xarray *bits_arr;
++	size_t folio_non_accessed;
++
++	mm = current ? current->mm : NULL;
++	if (!mm)
++		return 0;
++
++	ret = filemap_get_access_bitmask(mapping, mm, &bits_arr);
++	if (ret)
++		return ret;
++
++	folio_non_accessed = 0;
++	ret = _filemap_test_accessed_bits(bits_arr, off, len, &folio_non_accessed);
++	if (ret)
++		return ret;
++
++	return (folio_non_accessed == 0) ? 0 : -ENOENT;
++}
+ static int filemap_test_accessed_bits_fbatch(struct address_space *mapping,
+ 		struct folio_batch *fbatch, struct mm_struct *mm,
+ 		size_t *non_accessed_folios)
+@@ -2859,10 +3103,16 @@ static int filemap_test_accessed_bits_fbatch(struct address_space *mapping,
+ 	if (ret)
+ 		return ret;
+ 
++
++
+ 	for (i = 0; i < folio_batch_count(fbatch); i++) {
+ 		idx = folio_index(fbatch->folios[i]);
+ 		cnt = folio_nr_pages(fbatch->folios[i]);
++		BUG_ON(!cnt);
+ 
++		ret = _filemap_transfer_async_accessed_state(mapping, idx, idx+cnt-1, bits_arr);
++		if (ret)
++			return ret;
+ 		ret = _filemap_test_accessed_bits(bits_arr, idx, cnt, &folio_non_accessed);
+ 		if (ret)
+ 			return ret;
+@@ -2934,19 +3184,20 @@ static int filemap_get_pages(struct kiocb *iocb, size_t count,
+ 	}
+ 
+ 
+-
+ 	folio = fbatch->folios[folio_batch_count(fbatch) - 1];
+-	if (folio_test_readahead(folio)) {
++
+ #ifdef CONFIG_PAGE_CACHE_ISOLATION
+ #ifdef CONFIG_PAGE_CACHE_ISOLATION_MIMIC_IO
+-		// We do not need to handle sync ra above - it only triggers if nothing
+-		// is in the page cache and will trigger marking a bit by allocation
+-		// Async readahead, though, needs to be handled
+-		err = readahead_set_accessed_bits_async(iocb, filp, mapping, folio, last_index, &non_accessed_folios);
+-		if (err)
+-			goto err;
++	// We do not need to handle sync ra above - it only triggers if nothing
++	// is in the page cache and will trigger marking a bit by allocation
++	// Async readahead, though, needs to be handled
++	err = readahead_set_accessed_bits_async(iocb, filp, mapping, folio, last_index, &non_accessed_folios);
++	if (err)
++		goto err;
+ #endif /* !CONFIG_PAGE_CACHE_ISOLATION_MIMIC_IO */
+ #endif /* CONFIG_PAGE_CACHE_ISOLATION */
++
++	if (folio_test_readahead(folio)) {
+ 		err = filemap_readahead(iocb, filp, mapping, folio, last_index);
+ 		if (err)
+ 			goto err;
+@@ -3571,7 +3822,46 @@ static int lock_folio_maybe_drop_mmap(struct vm_fault *vmf, struct folio *folio,
+  * that.  If we didn't pin a file then we return NULL.  The file that is
+  * returned needs to be fput()'ed when we're done with it.
+  */
+-static struct file *do_sync_mmap_readahead(struct vm_fault *vmf)
++static void _sync_mmap_readahead_prepare_ra(struct file_ra_state *ra,
++		struct vm_fault *vmf)
++{
++	vm_flags_t vm_flags = vmf->vma->vm_flags;
++
++	if (vm_flags & VM_EXEC) {
++		/*
++		 * Allow arch to request a preferred minimum folio order for
++		 * executable memory. This can often be beneficial to
++		 * performance if (e.g.) arm64 can contpte-map the folio.
++		 * Executable memory rarely benefits from readahead, due to its
++		 * random access nature, so set async_size to 0.
++		 *
++		 * Limit to the boundaries of the VMA to avoid reading in any
++		 * pad that might exist between sections, which would be a waste
++		 * of memory.
++		 */
++		struct vm_area_struct *vma = vmf->vma;
++		unsigned long start = vma->vm_pgoff;
++		unsigned long end = start + vma_pages(vma);
++		unsigned long ra_end;
++
++		ra->order = exec_folio_order();
++		ra->start = round_down(vmf->pgoff, 1UL << ra->order);
++		ra->start = max(ra->start, start);
++		ra_end = round_up(ra->start + ra->ra_pages, 1UL << ra->order);
++		ra_end = min(ra_end, end);
++		ra->size = ra_end - ra->start;
++		ra->async_size = 0;
++	} else {
++		/*
++		 * mmap read-around
++		 */
++		ra->start = max_t(long, 0, vmf->pgoff - ra->ra_pages / 2);
++		ra->size = ra->ra_pages;
++		ra->async_size = ra->ra_pages / 4;
++		ra->order = 0;
++	}
++}
++static struct file *do_sync_mmap_readahead(struct vm_fault *vmf, bool *did_io)
+ {
+ 	struct file *file = vmf->vma->vm_file;
+ 	struct file_ra_state *ra = &file->f_ra;
+@@ -3611,7 +3901,9 @@ static struct file *do_sync_mmap_readahead(struct vm_fault *vmf)
+ 
+ 	if (vm_flags & VM_SEQ_READ) {
+ 		fpin = maybe_unlock_mmap_for_io(vmf, fpin);
++		/* page_cache_sync_ra does alloc pages and add accessed bits */
+ 		page_cache_sync_ra(&ractl, ra->ra_pages);
++		*did_io = true;
+ 		return fpin;
+ 	}
+ 
+@@ -3627,43 +3919,13 @@ static struct file *do_sync_mmap_readahead(struct vm_fault *vmf)
+ 	if (mmap_miss > MMAP_LOTSAMISS)
+ 		return fpin;
+ 
+-	if (vm_flags & VM_EXEC) {
+-		/*
+-		 * Allow arch to request a preferred minimum folio order for
+-		 * executable memory. This can often be beneficial to
+-		 * performance if (e.g.) arm64 can contpte-map the folio.
+-		 * Executable memory rarely benefits from readahead, due to its
+-		 * random access nature, so set async_size to 0.
+-		 *
+-		 * Limit to the boundaries of the VMA to avoid reading in any
+-		 * pad that might exist between sections, which would be a waste
+-		 * of memory.
+-		 */
+-		struct vm_area_struct *vma = vmf->vma;
+-		unsigned long start = vma->vm_pgoff;
+-		unsigned long end = start + vma_pages(vma);
+-		unsigned long ra_end;
+-
+-		ra->order = exec_folio_order();
+-		ra->start = round_down(vmf->pgoff, 1UL << ra->order);
+-		ra->start = max(ra->start, start);
+-		ra_end = round_up(ra->start + ra->ra_pages, 1UL << ra->order);
+-		ra_end = min(ra_end, end);
+-		ra->size = ra_end - ra->start;
+-		ra->async_size = 0;
+-	} else {
+-		/*
+-		 * mmap read-around
+-		 */
+-		ra->start = max_t(long, 0, vmf->pgoff - ra->ra_pages / 2);
+-		ra->size = ra->ra_pages;
+-		ra->async_size = ra->ra_pages / 4;
+-		ra->order = 0;
+-	}
++	_sync_mmap_readahead_prepare_ra(ra, vmf);
+ 
+ 	fpin = maybe_unlock_mmap_for_io(vmf, fpin);
+ 	ractl._index = ra->start;
++	/* page_cache_ra_order does alloc pages and add accessed bits */
+ 	page_cache_ra_order(&ractl, ra);
++	*did_io = true;
+ 	return fpin;
+ }
+ 
+@@ -3699,11 +3961,179 @@ static struct file *do_async_mmap_readahead(struct vm_fault *vmf,
+ 
+ 	if (folio_test_readahead(folio)) {
+ 		fpin = maybe_unlock_mmap_for_io(vmf, fpin);
++		/* page_cache_async_ra does alloc pages and add accessed bits */
+ 		page_cache_async_ra(&ractl, folio, ra->ra_pages);
+ 	}
+ 	return fpin;
+ }
+ 
++#ifdef CONFIG_PAGE_CACHE_ISOLATION
++static int filemap_mimick_sync_fault(struct vm_fault *vmf,
++		struct address_space *mapping,
++		struct folio *folio, struct file **fpin)
++{
++	int err = 0;
++	bool did_sync_io = false;
++	struct folio *new_folio;
++	struct file *file = vmf->vma->vm_file;
++	struct file_ra_state *ra = &file->f_ra;
++	vm_flags_t vm_flags = vmf->vma->vm_flags;
++	off_t start, end;
++	struct address_space *fake_mapping;
++
++	if (!current)
++		return 0;
++
++	err = filemap_get_access_sync_mimic_mapping(mapping, current->mm, &fake_mapping);
++	if (err)
++		return err;
++
++	/*
++	 * This is analog to do_sync_map_readahead and the
++	 * page_not_uptodate pathway because they interplay a lot:
++	 * - At first we see if we want to do readahead at all according
++	 *   to the VMA flags. If not, readahead is skipped
++	 * - If too many folios were missed, readahead is also skipped
++	 * - If no readahead was performed, a new folio is allocated
++	 *   (FGP_CREAT|FGP_FOR_MMP), acquired, locked but is not uptodate.
++	 *   -> page_not_uptodate fills the page
++	 */
++
++	/*
++	 * If we don't want any read-ahead, don't bother. VM_EXEC case below is
++	 * already intended for random access.
++	 */
++	if ((vm_flags & (VM_RAND_READ | VM_EXEC)) == VM_RAND_READ)
++		goto single_folio_read;
++	if (!ra->ra_pages)
++		goto single_folio_read;
++	// TODO: LOTSAMISS (probably with separate readahead state)
++
++	/*
++	 * We did not bail out of readahead - the readahead if we want
++	 * non-sequential behaviour
++	 */
++	DEFINE_READAHEAD(ractl, file, ra, fake_mapping, vmf->pgoff);
++
++	if (!(vm_flags & VM_SEQ_READ)) {
++		_sync_mmap_readahead_prepare_ra(ra, vmf);
++	} // TODO: separate readahead state for mimick
++
++	*fpin = maybe_unlock_mmap_for_io(vmf, *fpin);
++
++	if (!(vm_flags & VM_SEQ_READ)) {
++		ractl._index = ra->start;
++		/* page_cache_ra_order does alloc pages and add accessed bits */
++		page_cache_ra_order(&ractl, ra);
++	} else {
++		page_cache_sync_ra(&ractl, ra->ra_pages);
++	}
++
++	// Start and end depends on the readahead state when we did I/O
++	did_sync_io = true;
++	start = ra->start;
++	end = start + (ra->size - ra->async_size) - 1;
++	
++single_folio_read:
++	filemap_invalidate_lock_shared(fake_mapping);
++	new_folio = __filemap_get_folio(fake_mapping, vmf->pgoff,
++				  FGP_CREAT | FGP_FOR_MMAP,
++				  vmf->gfp_mask);
++	if (IS_ERR(new_folio)) {
++		err = -ENOMEM;
++		filemap_invalidate_unlock_shared(fake_mapping);
++		goto out_err;
++	}
++
++	/* In case we did no sync I/O, we'll only read a single folio */
++	if (!did_sync_io) {
++		start = folio_index(new_folio);
++		end = start + folio_nr_pages(new_folio) - 1;
++	}
++
++	if (folio_test_uptodate(new_folio))
++		goto cleanup_fake_mapping;
++
++	*fpin = maybe_unlock_mmap_for_io(vmf, *fpin);
++	/* filemap_read_folio waits (killable) for the locked bit. */
++	folio_lock(new_folio);
++
++	/* Maybe it has been brought uptodate by now by the previous lock owner? */
++	if (folio_test_uptodate(new_folio)) {
++		folio_unlock(new_folio);
++		goto cleanup_fake_mapping;
++	}
++
++	err = filemap_read_folio(file, mapping->a_ops->read_folio, new_folio);
++
++cleanup_fake_mapping:
++
++	readahead_apply_fake_mapping_pages(fake_mapping, mapping, start, end);
++
++	/*
++	 * Unlock the invalidate_lock to allow truncation, put the folio afterwards.
++	 * This maintains the lock protocol that was established as described in
++	 * filemap_create_folio.
++	 * Then we can finally request the read pages to be invalidated.
++	 */
++	filemap_invalidate_unlock_shared(fake_mapping);
++	folio_put(new_folio);
++	invalidate_mapping_pages(fake_mapping, start, end);
++
++out_err:
++	return err;
++}
++static int filemap_mimick_async_fault(struct vm_fault *vmf,
++		struct address_space *mapping,
++		struct folio *folio, struct file **fpin)
++{
++	struct inode *inode = mapping->host;
++	struct file *file = vmf->vma->vm_file;
++	struct file_ra_state *ra = &file->f_ra;
++	pgoff_t end_index = (i_size_read(inode) - 1) >> PAGE_SHIFT;
++
++	if (!current)
++		return 0;
++
++	/* only do readahead on the first try */
++	if ((vmf->flags & FAULT_FLAG_TRIED))
++		return 0;
++
++	/* If we don't want any read-ahead, don't bother */
++	if (vmf->vma->vm_flags & VM_RAND_READ || !ra->ra_pages)
++		return 0;
++
++	if (!mapping->i_mm_async_mimic_mapping) {
++		struct address_space *fake_mapping = kmalloc(sizeof(*fake_mapping), GFP_KERNEL);
++		if (!fake_mapping)
++			return -ENOMEM;
++
++		readahead_init_fake_mapping(fake_mapping, mapping);
++		mapping->i_mm_async_mimic_mapping = fake_mapping;
++	}
++
++	// TODO: FLAG HANDLING (readahead)!!!!
++	pgoff_t ra_start = vmf->pgoff + 1;
++	pgoff_t ra_end = ra_start + ra->ra_pages - 1;
++
++	if (ra_start > end_index)
++		goto out_skip_io;
++
++	ra_end = min(ra_end, end_index);
++	off_t ra_size = ra_end - ra_start + 1;
++	filemap_peek_transfer_async_accessed_state(mapping, ra_start, ra_end);
++	if (filemap_test_accessed_fault(mapping, ra_start, ra_size)) {
++		*fpin = maybe_unlock_mmap_for_io(vmf, *fpin);
++
++		DEFINE_READAHEAD(ractl, file, ra, mapping->i_mm_async_mimic_mapping, ra_start);
++		page_cache_async_ra(&ractl, folio, ra_size);
++	}
++
++out_skip_io:
++	return 0;
++}
++#endif /* CONFIG_PAGE_CACHE_ISOLATION */
++
+ static vm_fault_t filemap_fault_recheck_pte_none(struct vm_fault *vmf)
+ {
+ 	struct vm_area_struct *vma = vmf->vma;
+@@ -3781,6 +4211,7 @@ vm_fault_t filemap_fault(struct vm_fault *vmf)
+ 	struct folio *folio;
+ 	vm_fault_t ret = 0;
+ 	bool mapping_locked = false;
++	bool did_sync_io = false;
+ 
+ 	max_idx = DIV_ROUND_UP(i_size_read(inode), PAGE_SIZE);
+ 	if (unlikely(index >= max_idx))
+@@ -3812,7 +4243,7 @@ vm_fault_t filemap_fault(struct vm_fault *vmf)
+ 		count_vm_event(PGMAJFAULT);
+ 		count_memcg_event_mm(vmf->vma->vm_mm, PGMAJFAULT);
+ 		ret = VM_FAULT_MAJOR;
+-		fpin = do_sync_mmap_readahead(vmf);
++		fpin = do_sync_mmap_readahead(vmf, &did_sync_io);
+ retry_find:
+ 		/*
+ 		 * See comment in filemap_create_folio() why we need
+@@ -3870,6 +4301,41 @@ vm_fault_t filemap_fault(struct vm_fault *vmf)
+ 		goto page_not_uptodate;
+ 	}
+ 
++#ifdef CONFIG_PAGE_CACHE_ISOLATION
++	/*
++	 * At this point we've found and locked an uptodate folio in the cache.
++	 * If no I/O was done yet, we now have to check if the task has "seen"
++	 * the page in its isolated view of the page cache.
++	 * That means potentially having to do mimick actual I/O to realistically
++	 * delay the execution as if the affected pages were not yet in the cache.
++	 */
++	error = 0;
++	if (!mapping_unevictable(mapping)) {
++		filemap_transfer_async_accessed_state_fault(vmf, mapping, folio, &fpin);
++		if (!filemap_test_accessed_fault(mapping, folio_index(folio), folio_nr_pages(folio))) {
++			/*
++			 * folio itself was seen. If no I/O was done, test
++			 * if we need to mimick async.
++			 */
++			if (!did_sync_io) {
++				// TODO
++				error = filemap_mimick_async_fault(vmf, mapping, folio, &fpin);
++			}
++		} else {
++			WARN_ON_ONCE(did_sync_io);
++			/*
++			 * folio was not seen. We have to mimick a major fault.
++			 */
++			count_vm_event(PGMAJFAULT);
++			count_memcg_event_mm(vmf->vma->vm_mm, PGMAJFAULT);
++			ret = VM_FAULT_MAJOR;
++
++			error = filemap_mimick_sync_fault(vmf, mapping, folio, &fpin);
++
++		}
++	}
++#endif /* CONFIG_PAGE_CACHE_ISOLATION */
++
+ 	/*
+ 	 * We've made it this far and we had to drop our mmap_lock, now is the
+ 	 * time to return to the upper layer and have it re-find the vma and
+@@ -3882,6 +4348,14 @@ vm_fault_t filemap_fault(struct vm_fault *vmf)
+ 	if (mapping_locked)
+ 		filemap_invalidate_unlock_shared(mapping);
+ 
++#ifdef CONFIG_PAGE_CACHE_ISOLATION
++	if (error) {
++		folio_unlock(folio);
++		folio_put(folio);
++		return (error == -ENOMEM) ? VM_FAULT_OOM : VM_FAULT_SIGBUS;
++	}
++#endif /* CONFIG_PAGE_CACHE_ISOLATION */
++
+ 	/*
+ 	 * Found the page and have a reference on it.
+ 	 * We must recheck i_size under page lock.
+@@ -3990,6 +4464,13 @@ static struct folio *next_uptodate_folio(struct xa_state *xas,
+ 		max_idx = DIV_ROUND_UP(i_size_read(mapping->host), PAGE_SIZE);
+ 		if (xas->xa_index >= max_idx)
+ 			goto unlock;
++
++#ifdef CONFIG_PAGE_CACHE_ISOLATION
++		/* Only return pages that have already been seen */
++		if (filemap_test_accessed_fault(mapping, folio_index(folio), folio_nr_pages(folio)))
++			goto unlock;
++#endif
++
+ 		return folio;
+ unlock:
+ 		folio_unlock(folio);
+@@ -4144,6 +4625,10 @@ vm_fault_t filemap_map_pages(struct vm_fault *vmf,
+ 	unsigned int nr_pages = 0, folio_type;
+ 	unsigned short mmap_miss = 0, mmap_miss_saved;
+ 
++#ifdef CONFIG_PAGE_CACHE_ISOLATION
++	filemap_peek_transfer_async_accessed_state(mapping, start_pgoff, end_pgoff);
++#endif
++
+ 	rcu_read_lock();
+ 	folio = next_uptodate_folio(&xas, mapping, end_pgoff);
+ 	if (!folio)
+diff --git a/mm/readahead.c b/mm/readahead.c
+index 925e6d863069..dfb11f79aef8 100644
+--- a/mm/readahead.c
++++ b/mm/readahead.c
+@@ -115,6 +115,7 @@
+ 
+ #include "linux/fs.h"
+ #include "linux/kern_levels.h"
++#include "linux/maple_tree.h"
+ #include "linux/mm.h"
+ #include "linux/pid.h"
+ #include "linux/xarray.h"
+@@ -845,6 +846,59 @@ EXPORT_SYMBOL(readahead_expand);
+ 
+ #ifdef CONFIG_PAGE_CACHE_ISOLATION
+ #ifdef CONFIG_PAGE_CACHE_ISOLATION_MIMIC_IO
++void readahead_init_fake_mapping(struct address_space *fake_mapping,
++		struct address_space *mapping)
++{
++	address_space_init_once(fake_mapping);
++
++	// TODO: Get/put a_ops?
++	fake_mapping->a_ops = mapping->a_ops;
++	fake_mapping->host = mapping->host;
++	fake_mapping->flags = mapping->flags;
++	fake_mapping->wb_err = mapping->wb_err;
++	atomic_set(&fake_mapping->i_mmap_writable, atomic_read(&mapping->i_mmap_writable));
++#ifdef CONFIG_READ_ONLY_THP_FOR_FS
++	atomic_set(&fake_mapping.nr_thps, atomic_read(&mapping->nr_thps));
++#endif
++	fake_mapping->gfp_mask = mapping->gfp_mask;
++	fake_mapping->nrpages = mapping->nrpages;
++	fake_mapping->i_private_data =  mapping->i_private_data;
++	fake_mapping->writeback_index = mapping->writeback_index;
++	init_rwsem(&fake_mapping->invalidate_lock);
++}
++void readahead_apply_fake_mapping_pages(struct address_space *fake_mapping,
++		struct address_space *mapping, loff_t start, loff_t end)
++{
++	unsigned long idx;
++	struct folio *entry;
++
++	if (current) {
++		xa_for_each_range(&fake_mapping->i_pages, idx, entry, start, end) {
++			//pr_err("%s: mapping=%p; add entry idx=%lu, len=%lu, %s/%d\n", __func__, mapping, folio_index(entry), folio_nr_pages(entry),
++			//		current->comm, task_pid_nr(current));
++			if (!folio_test_locked(entry) && folio_test_uptodate(entry))
++				filemap_set_accessed_bits(mapping, current->mm, folio_index(entry), folio_nr_pages(entry));
++		}
++	}
++}
++void readahead_finalize_fake_mapping(struct address_space *fake_mapping,
++		struct address_space *mapping)
++{
++	unsigned long idx;
++	struct access_bits_struct *bitf;
++
++	readahead_apply_fake_mapping_pages(fake_mapping, mapping, 0, ULONG_MAX);
++	truncate_inode_pages_range(fake_mapping, 0, ULONG_MAX);
++
++	mt_for_each(&fake_mapping->i_mm_access_bits, bitf, idx, ULONG_MAX) {
++		xa_destroy(&bitf->bits_arr);
++		kfree(bitf);
++	}
++
++	BUG_ON(!xa_empty(&fake_mapping->i_pages));
++	xa_destroy(&fake_mapping->i_pages);
++	mtree_destroy(&fake_mapping->i_mm_access_bits);
++}
+ int readahead_mimic_sync(struct address_space *mapping, struct file *filp,
+ 		unsigned long index, unsigned int count)
+ {
+@@ -852,43 +906,17 @@ int readahead_mimic_sync(struct address_space *mapping, struct file *filp,
+ 	// folio in
+ 
+ 	struct address_space fake_mapping;
+-	address_space_init_once(&fake_mapping);
+-
+-	// TODO: Get/put a_ops?
+-	fake_mapping.a_ops = mapping->a_ops;
+-	fake_mapping.host = mapping->host;
+-	fake_mapping.flags = mapping->flags;
+-	fake_mapping.wb_err = mapping->wb_err;
+-	atomic_set(&fake_mapping.i_mmap_writable, atomic_read(&mapping->i_mmap_writable));
+-#ifdef CONFIG_READ_ONLY_THP_FOR_FS
+-	atomic_set(&fake_mapping.nr_thps, atomic_read(&mapping->nr_thps));
+-#endif
+-	fake_mapping.gfp_mask = mapping->gfp_mask;
+-	fake_mapping.nrpages = mapping->nrpages;
+-	fake_mapping.i_private_data =  mapping->i_private_data;
+-	fake_mapping.writeback_index = mapping->writeback_index;
+-	init_rwsem(&mapping->invalidate_lock);
++	readahead_init_fake_mapping(&fake_mapping, mapping);
+ 
+ 
+ 	DEFINE_READAHEAD(ractl, filp, &filp->f_ra, &fake_mapping, index);
+ 
+ 	page_cache_sync_ra(&ractl, count);
+-	filemap_set_accessed_bits(mapping, current->mm, index, filp->f_ra.size);
+ 
+ 	WARN_ON(xa_empty(&fake_mapping.i_pages));
+-
+-	unsigned long idx;
+-	struct folio *entry;
+-	xa_for_each(&fake_mapping.i_pages, idx, entry) {
+-
+-	}
+-
+ 	//folio_wait_locked(folio);
+-	truncate_inode_pages(&fake_mapping, index);
+-
+-	BUG_ON(!xa_empty(&fake_mapping.i_pages));
+-	xa_destroy(&fake_mapping.i_pages);
+-	mtree_destroy(&fake_mapping.i_mm_access_bits);
++	
++	readahead_finalize_fake_mapping(&fake_mapping, mapping);
+ 
+ 	return 0;
+ }
+@@ -898,25 +926,41 @@ int readahead_set_accessed_bits_async(struct kiocb *iocb, struct file *filp,
+ 		struct address_space *mapping, struct folio *folio,
+ 		pgoff_t last_index, size_t *non_accessed_folios)
+ {
+-	// We'll take the old state, and apply the async readahead state to our bitfield
+-	// The ra_state is in the file struct, and thus per-task.
+-	struct file_ra_state *ra = &filp->f_ra;
+ 
+-	pr_debug("%s: starting accessed readahead: %p %s/%d\n", __func__, mapping, current->comm, task_pid_nr(current));
++	// TODO: Likely needs locking
++	if (!mapping->i_mm_async_mimic_mapping) {
++		struct address_space *fake_mapping = kmalloc(sizeof(*fake_mapping), GFP_KERNEL);
++		if (!fake_mapping)
++			return -ENOMEM;
+ 
+-	rcu_read_lock();
+-	XA_STATE(xas, &mapping->i_pages, ra->start + (ra->size - ra->async_size));
++		address_space_init_once(fake_mapping);
+ 
+-	while (xas.xa_index < ra->start + ra->size && xas.xa_index >= ra->start) {
+-		struct folio *entry = xas_next(&xas);
+-		if (!entry || xa_is_value(entry))
+-			continue;
++		// TODO: Get/put a_ops?
++		fake_mapping->a_ops = mapping->a_ops;
++		fake_mapping->host = mapping->host;
++		fake_mapping->flags = mapping->flags;
++		fake_mapping->wb_err = mapping->wb_err;
++		atomic_set(&fake_mapping->i_mmap_writable, atomic_read(&mapping->i_mmap_writable));
++#ifdef CONFIG_READ_ONLY_THP_FOR_FS
++		atomic_set(&fake_mapping->nr_thps, atomic_read(&mapping->nr_thps));
++#endif
++		fake_mapping->gfp_mask = mapping->gfp_mask;
++		fake_mapping->nrpages = mapping->nrpages;
++		fake_mapping->i_private_data =  mapping->i_private_data;
++		fake_mapping->writeback_index = mapping->writeback_index;
++		init_rwsem(&fake_mapping->invalidate_lock);
+ 
+-		pr_debug("%s:    %p: idx=%lu, cnt=%lu %s/%d\n", __func__, mapping, folio_index(entry), folio_nr_pages(entry), current->comm, task_pid_nr(current));
+-		filemap_set_accessed_bits(mapping, current->mm, folio_index(entry), folio_nr_pages(entry));
++		mapping->i_mm_async_mimic_mapping = fake_mapping;
+ 	}
+ 
+-	rcu_read_unlock();
++
++	DEFINE_READAHEAD(ractl, filp, &filp->f_ra, mapping->i_mm_async_mimic_mapping, folio->index);
++	// TODO: FLAG HANDLING!!!!
++	// TODO: Maybe handle folio readahead bit instead of unconditional readahead - this makes
++	//       it more realistic and is necessary to prevent other side-channels.
++	//       For this, we may need some extra f_ra for "fake" readaheads
++	page_cache_async_ra(&ractl, folio, last_index - folio->index);
++
+ 
+ 
+ 	return 0;
+-- 
+2.55.0
+

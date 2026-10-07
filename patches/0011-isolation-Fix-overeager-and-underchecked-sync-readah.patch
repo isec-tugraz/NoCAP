@@ -1,0 +1,104 @@
+From 281d9efd339db837f527e13606d24b85870f371b Mon Sep 17 00:00:00 2001
+From: Marcell Matthias Haritopoulos <marcell.haritopoulos@student.tugraz.at>
+Date: Sun, 26 Apr 2026 07:58:17 +0200
+Subject: [PATCH 11/13] isolation: Fix overeager and underchecked sync
+ readahead mimic
+
+The amount of folios that were mimicked to be synchronously read ahead
+was way too much because even though the function is called
+filemap_get_pages, the count it gets is in bytes.
+Also, the readahead_apply_fake_mapping_pages function did check if the
+mapping was uptodate to apply the accessed but, but it did not wait for
+completion. That would especially for HDDs with longer seek and read
+times mean that we would re-issue a lot of fake sync readaheads over and
+over again.
+---
+ mm/filemap.c   |  4 +---
+ mm/readahead.c | 48 ++++++++++++++++++++++++++++++++++++++++--------
+ 2 files changed, 41 insertions(+), 11 deletions(-)
+
+diff --git a/mm/filemap.c b/mm/filemap.c
+index dfff2defd2f2..5aefafe0fba7 100644
+--- a/mm/filemap.c
++++ b/mm/filemap.c
+@@ -3232,9 +3232,7 @@ static int filemap_get_pages(struct kiocb *iocb, size_t count,
+ 	 */
+ 	if (non_accessed_folios && !mapping_unevictable(mapping)) {
+ #ifdef CONFIG_PAGE_CACHE_ISOLATION_MIMIC_IO
+-		pr_debug("filemap_get_pages: mimicing sync readahead: mapping=%p, filp=%p\n",
+-				mapping, filp);
+-		readahead_mimic_sync(mapping, filp, index, count);
++		readahead_mimic_sync(mapping, filp, index, last_index);
+ #else
+ 		filemap_access_delay_task();
+ #endif /* CONFIG_PAGE_CACHE_ISOLATION_MIMIC_IO */
+diff --git a/mm/readahead.c b/mm/readahead.c
+index dfb11f79aef8..ee5dce4505c6 100644
+--- a/mm/readahead.c
++++ b/mm/readahead.c
+@@ -869,15 +869,46 @@ void readahead_init_fake_mapping(struct address_space *fake_mapping,
+ void readahead_apply_fake_mapping_pages(struct address_space *fake_mapping,
+ 		struct address_space *mapping, loff_t start, loff_t end)
+ {
+-	unsigned long idx;
+-	struct folio *entry;
+-
+ 	if (current) {
+-		xa_for_each_range(&fake_mapping->i_pages, idx, entry, start, end) {
+-			//pr_err("%s: mapping=%p; add entry idx=%lu, len=%lu, %s/%d\n", __func__, mapping, folio_index(entry), folio_nr_pages(entry),
+-			//		current->comm, task_pid_nr(current));
+-			if (!folio_test_locked(entry) && folio_test_uptodate(entry))
+-				filemap_set_accessed_bits(mapping, current->mm, folio_index(entry), folio_nr_pages(entry));
++
++		XA_STATE(xas, &fake_mapping->i_pages, start);
++		struct folio *folio;
++		while ((folio = xas_next_entry(&xas, end)) != NULL) {
++
++			// Analogous to next_uptodate_folio
++			if (!folio)
++				break;
++			if (xas_retry(&xas, folio))
++				continue;
++			if (xa_is_value(folio))
++				continue;
++			if (!folio_try_get(folio))
++				continue;
++			// Up from here we've incrmeneted the refcount
++
++			/* Has the page moved or been split? */
++			if (unlikely(folio != xas_reload(&xas)))
++				goto deref;
++
++			// TODO: Shortcut of test_uptodate to prevent locking?
++			if (folio_test_uptodate(folio)) {
++				filemap_set_accessed_bits(mapping, current->mm, folio_index(folio), folio_nr_pages(folio));
++				goto deref;
++			}
++
++			// Analogous to filemap_read_folio
++			folio_wait_locked(folio);
++
++			if (folio->mapping != fake_mapping)
++				goto deref;
++
++			if (!folio_test_uptodate(folio))
++				goto deref;
++
++			filemap_set_accessed_bits(mapping, current->mm, folio_index(folio), folio_nr_pages(folio));
++
++deref:
++			folio_put(folio);
+ 		}
+ 	}
+ }
+@@ -907,6 +938,7 @@ int readahead_mimic_sync(struct address_space *mapping, struct file *filp,
+ 
+ 	struct address_space fake_mapping;
+ 	readahead_init_fake_mapping(&fake_mapping, mapping);
++	WARN_ON(!xa_empty(&fake_mapping.i_pages));
+ 
+ 
+ 	DEFINE_READAHEAD(ractl, filp, &filp->f_ra, &fake_mapping, index);
+-- 
+2.55.0
+

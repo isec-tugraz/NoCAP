@@ -1,0 +1,80 @@
+From 22f176d7e87aca63f9162f40e1e47877497cbd88 Mon Sep 17 00:00:00 2001
+From: Marcell Matthias Haritopoulos <marcell.haritopoulos@student.tugraz.at>
+Date: Sun, 21 Dec 2025 04:29:34 +0100
+Subject: [PATCH 04/13] filemap: clear accessed bit when folio is deleted from
+ page cache
+
+When a folio gets evacuated from the page cache, we have to also clear
+the respective bits on all associated struct mm. In that case, we have
+to subject all VMAs to the first-time load delay. Otherwise, an attacker
+could just walk through the first first-time load delay to set the bit,
+and then try to force an evacuation of the folio and do a flush+reload
+from there.
+---
+ mm/filemap.c | 43 +++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 43 insertions(+)
+
+diff --git a/mm/filemap.c b/mm/filemap.c
+index 01d54fbc1cc3..62e49bf0fb4a 100644
+--- a/mm/filemap.c
++++ b/mm/filemap.c
+@@ -133,6 +133,45 @@
+  */
+ 
+ #ifdef CONFIG_PAGE_CACHE_ISOLATION
++static void mapping_clear_accessed_bits(struct address_space *mapping,
++                   struct folio *folio)
++{
++   struct xarray *bits_arr;
++   unsigned long bitfield, old;
++   unsigned long key = 0;
++   pgoff_t pg_idx;
++   void *val;
++   int i;
++
++
++   mt_for_each(&mapping->i_mm_access_bits, bits_arr, key, ULONG_MAX) {
++       pr_info("mapping_clear_accessed_bits:   bf key=%lx, bf=%p", key, bits_arr);
++
++		   xa_lock_irq(&access->bits_arr);
++
++           xa_lock_irq(bits_arr);
++
++           val = xa_load(bits_arr, pg_idx);
++           if (val == NULL)
++               goto unlock_cont;
++
++           bitfield = xa_to_value(val);
++           old = bitfield;
++           bitfield &= ~(1 << (i % sizeof(unsigned long)));
++
++           __xa_store(bits_arr, pg_idx, xa_mk_value(bitfield), GFP_KERNEL);
++
++
++           pr_debug("mapping_clear_accessed_bits:     bfi=%lx: %lx -> %lx", pg_idx, old, bitfield);
++
++		   __xa_store(&access->bits_arr, pg_idx, xa_mk_value(bitfield), GFP_KERNEL);
++unlock_cont:
++           xa_unlock_irq(bits_arr);
++       }
++   }
++}
++
++
+ static int filemap_get_access_bitmask(struct address_space *mapping,
+ 		struct mm_struct *mm, struct xarray **out)
+ {
+@@ -245,6 +284,10 @@ static void page_cache_delete(struct address_space *mapping,
+ 	xas_store(&xas, shadow);
+ 	xas_init_marks(&xas);
+ 
++#ifdef CONFIG_PAGE_CACHE_ISOLATION
++	mapping_clear_accessed_bits(mapping, folio);
++#endif /* CONFIG_PAGE_CACHE_ISOLATION */
++
+ 	folio->mapping = NULL;
+ 	/* Leave folio->index set: truncation lookup relies upon it */
+ 	mapping->nrpages -= nr;
+-- 
+2.55.0
+

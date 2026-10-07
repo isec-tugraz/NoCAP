@@ -1,0 +1,61 @@
+From e6cf33f4706dab0602b98fa8ef7032313d0192d2 Mon Sep 17 00:00:00 2001
+From: Marcell Matthias Haritopoulos <marcell.haritopoulos@student.tugraz.at>
+Date: Tue, 1 Apr 2025 03:22:52 +0200
+Subject: [PATCH 05/13] filemap: naively delay task by 25..100us if at least
+ one first access
+
+When at least one folio has been used for the first time after it was
+loaded into the page cache, suspend the task execution by 25..100us to mimic
+a read on a SSD. The task is put into uninterruptible sleep as I/O
+commonly does so make characterization not all too easy.
+
+filemap: use random delay for first-time-read delay
+
+Instead of a fixated delay, use a (currently non-uniform) delay between
+25 and 100us.
+---
+ mm/filemap.c | 21 +++++++++++++++++++++
+ 1 file changed, 21 insertions(+)
+
+diff --git a/mm/filemap.c b/mm/filemap.c
+index 62e49bf0fb4a..d9ab3e0caf31 100644
+--- a/mm/filemap.c
++++ b/mm/filemap.c
+@@ -2786,6 +2786,19 @@ static int filemap_set_accessed_bits_fbatch(struct address_space *mapping,
+ 
+ 	return 0;
+ }
++
++static int filemap_access_delay_task(void) {
++	/* TASK_UNINTERRUPTIBLE mimics how I/O blocks the task */
++	/* TODO: Maybe we have to check rest jiffies? */
++
++	u8 delay;
++
++	/* random delay: [25, 100]us */
++	delay = (get_random_u8() % 76) + 25;
++
++	schedule_timeout_uninterruptible(usecs_to_jiffies(delay));
++	return 0;
++}
+ #endif
+ 
+ static int filemap_get_pages(struct kiocb *iocb, size_t count,
+@@ -2853,6 +2866,14 @@ static int filemap_get_pages(struct kiocb *iocb, size_t count,
+ 	err = filemap_set_accessed_bits_fbatch(mapping, fbatch, current->mm, &non_accessed_folios);
+ 	if (err)
+ 		goto err;
++
++	/*
++	 * naive approach - as soon as one folio was not yet accessed
++	 * after a flush, block the task.
++	 */
++	if (non_accessed_folios && !mapping_unevictable(mapping)) {
++		filemap_access_delay_task();
++	}
+ #endif /* CONFIG_PAGE_CACHE_ISOLATION */
+ 
+ 	trace_mm_filemap_get_pages(mapping, index, last_index - 1);
+-- 
+2.55.0
+

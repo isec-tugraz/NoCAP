@@ -1,0 +1,37 @@
+From 0d816e68fb869b60bbc2dd669f0bf6163041c388 Mon Sep 17 00:00:00 2001
+From: Marcell Matthias Haritopoulos <marcell.haritopoulos@student.tugraz.at>
+Date: Fri, 7 Aug 2026 05:34:41 +0200
+Subject: [PATCH 01/13] mm/Kconfig: Add CONFIG_PAGE_CACHE_ISOLATION
+
+---
+ mm/Kconfig | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/mm/Kconfig b/mm/Kconfig
+index ca3f146bc705..545951f2c0b7 100644
+--- a/mm/Kconfig
++++ b/mm/Kconfig
+@@ -1379,6 +1379,20 @@ config PT_RECLAIM
+ config FIND_NORMAL_PAGE
+ 	def_bool n
+ 
++config PAGE_CACHE_ISOLATION
++	bool "isolate page cache state from distinct mm_struct"
++	default n
++	help
++	  Isolates the state of the page cache across distinct struct mm
++	  to prevent side-channels using folios.
++
++	  For this, each mapping keeps track of the pages that have been seen
++	  for a specific mm_struct. When a mm_struct touches a page, its access
++	  bit is set, flushing the page out clears the bit for all mm_struct.
++	  If a mm_struct has seen the page for the first time (e.g. its bit was
++	  clear and it did not initialize the readahead), the task is
++	  delayed synthetically to mimic a page cache miss and readahead.
++
+ source "mm/damon/Kconfig"
+ 
+ endmenu
+-- 
+2.55.0
+

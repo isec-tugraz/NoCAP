@@ -1,0 +1,201 @@
+From e1fd6053b6a7dac744c695688fa797c1b9c9c7de Mon Sep 17 00:00:00 2001
+From: Marcell Matthias Haritopoulos <marcell.haritopoulos@student.tugraz.at>
+Date: Sat, 8 Aug 2026 05:27:41 +0200
+Subject: [PATCH 13/13] filemap: add tracing calls
+
+---
+ fs/read_write.c | 34 ++++++++++++++++++++++++++++++++++
+ fs/splice.c     |  5 +++++
+ mm/Kconfig      | 14 ++++++++++++++
+ mm/fadvise.c    |  5 +++++
+ mm/memory.c     |  5 +++++
+ mm/readahead.c  |  6 ++++++
+ 6 files changed, 69 insertions(+)
+
+diff --git a/fs/read_write.c b/fs/read_write.c
+index c907e7f1c9f3..b16f35f72f33 100644
+--- a/fs/read_write.c
++++ b/fs/read_write.c
+@@ -5,6 +5,7 @@
+  *  Copyright (C) 1991, 1992  Linus Torvalds
+  */
+ 
++#include "linux/printk.h"
+ #include <linux/slab.h>
+ #include <linux/stat.h>
+ #include <linux/sched/xacct.h>
+@@ -719,6 +720,11 @@ ssize_t ksys_read(unsigned int fd, char __user *buf, size_t count)
+ 	CLASS(fd_pos, f)(fd);
+ 	ssize_t ret = -EBADF;
+ 
++#ifdef CONFIG_PAGE_CACHE_ISOLATION_TRACING
++	pr_debug("%s: called from (%s/%d) for FD %d\n", __func__, current ? current->comm : "?",
++			current ? current->pid : 0, fd);
++#endif
++
+ 	if (!fd_empty(f)) {
+ 		loff_t pos, *ppos = file_ppos(fd_file(f));
+ 		if (ppos) {
+@@ -768,6 +774,11 @@ ssize_t ksys_pread64(unsigned int fd, char __user *buf, size_t count,
+ 	if (pos < 0)
+ 		return -EINVAL;
+ 
++#ifdef CONFIG_PAGE_CACHE_ISOLATION_TRACING
++	pr_debug("%s: called from (%s/%d) for FD %d\n", __func__, current ? current->comm : "?",
++			current ? current->pid : 0, fd);
++#endif
++
+ 	CLASS(fd, f)(fd);
+ 	if (fd_empty(f))
+ 		return -EBADF;
+@@ -1084,6 +1095,12 @@ static ssize_t do_readv(unsigned long fd, const struct iovec __user *vec,
+ 	CLASS(fd_pos, f)(fd);
+ 	ssize_t ret = -EBADF;
+ 
++#ifdef CONFIG_PAGE_CACHE_ISOLATION_TRACING
++	// Covers readv, preadv2, preadv2v64
++	pr_debug("%s: called from (%s/%d) for FD %lu\n", __func__, current ? current->comm : "?",
++			current ? current->pid : 0, fd);
++#endif
++
+ 	if (!fd_empty(f)) {
+ 		loff_t pos, *ppos = file_ppos(fd_file(f));
+ 		if (ppos) {
+@@ -1135,6 +1152,12 @@ static ssize_t do_preadv(unsigned long fd, const struct iovec __user *vec,
+ {
+ 	ssize_t ret = -EBADF;
+ 
++#ifdef CONFIG_PAGE_CACHE_ISOLATION_TRACING
++	// Covers preadv preadv2 preadv64 preadv64v2
++	pr_debug("%s: called from (%s/%d) for FD %lu\n", __func__, current ? current->comm : "?",
++			current ? current->pid : 0, fd);
++#endif
++
+ 	if (pos < 0)
+ 		return -EINVAL;
+ 
+@@ -1322,6 +1345,12 @@ static ssize_t do_sendfile(int out_fd, int in_fd, loff_t *ppos,
+ 	ssize_t retval;
+ 	int fl;
+ 
++#ifdef CONFIG_PAGE_CACHE_ISOLATION_TRACING
++	// Covers sendfile sendfile64
++	pr_debug("%s: called from (%s/%d) for FD %d\n", __func__, current ? current->comm : "?",
++			current ? current->pid : 0, in_fd);
++#endif
++
+ 	/*
+ 	 * Get input file, and verify that it is ok..
+ 	 */
+@@ -1666,6 +1695,11 @@ SYSCALL_DEFINE6(copy_file_range, int, fd_in, loff_t __user *, off_in,
+ 	loff_t pos_out;
+ 	ssize_t ret = -EBADF;
+ 
++#ifdef CONFIG_PAGE_CACHE_ISOLATION_TRACING
++	pr_debug("%s: called from (%s/%d) for FDs %d %d\n", __func__, current ? current->comm : "?",
++			current ? current->pid : 0, fd_in, fd_out);
++#endif
++
+ 	CLASS(fd, f_in)(fd_in);
+ 	if (fd_empty(f_in))
+ 		return -EBADF;
+diff --git a/fs/splice.c b/fs/splice.c
+index f5094b6d00a0..8ac871ab581a 100644
+--- a/fs/splice.c
++++ b/fs/splice.c
+@@ -1619,6 +1619,11 @@ SYSCALL_DEFINE6(splice, int, fd_in, loff_t __user *, off_in,
+ 		int, fd_out, loff_t __user *, off_out,
+ 		size_t, len, unsigned int, flags)
+ {
++#ifdef CONFIG_PAGE_CACHE_ISOLATION_TRACING
++	pr_debug("%s: called from (%s/%d) for FD %d\n", __func__, current ? current->comm : "?",
++			current ? current->pid : 0, fd_in);
++#endif
++
+ 	if (unlikely(!len))
+ 		return 0;
+ 
+diff --git a/mm/Kconfig b/mm/Kconfig
+index 0aa4e5c09f51..20c0ed18f02d 100644
+--- a/mm/Kconfig
++++ b/mm/Kconfig
+@@ -1425,6 +1425,20 @@ config PAGE_CACHE_ISOLATION_DELAYED_FADV_DONTNEED
+ 	  Specifying both the constant and wait factor to 0 disables the constant
+ 	  time delay at runtime.
+ 
++config PAGE_CACHE_ISOLATION_TRACING
++	bool "emit verbose page cache isolation bitmask logs"
++	default n
++	depends on PAGE_CACHE_ISOLATION
++	help
++	  Enables very verbose logging that prints what operations on the first-time
++	  seen bitmaks are performed, dumps the current state and helps tracing what's
++	  going on.
++
++	  This will slow down the system heavily due to the sheer amount of logs!
++	  It is a good idea to use DYNAMIC_DEBUG and a high boot loglevel with this
++	  option.
++	  Say N here unless you really have to.
++
+ 
+ endif # PAGE_CACHE_ISOLATION
+ 
+diff --git a/mm/fadvise.c b/mm/fadvise.c
+index 8a1472f5b1e7..bad71f28546b 100644
+--- a/mm/fadvise.c
++++ b/mm/fadvise.c
+@@ -47,6 +47,11 @@ int generic_fadvise(struct file *file, loff_t offset, loff_t len, int advice)
+ 	u64 delay_tsc;
+ #endif /* CONFIG_PAGE_CACHE_ISOLATION_DELAYED_FADV_DONTNEED */
+ 
++#ifdef CONFIG_PAGE_CACHE_ISOLATION_TRACING
++	pr_debug("%s: called from (%s/%d) for %s advice %d\n", __func__, current ? current->comm : "?",
++			current ? current->pid : 0, file->f_path.dentry->d_name.name, advice);
++#endif
++
+ 	inode = file_inode(file);
+ 	if (S_ISFIFO(inode->i_mode))
+ 		return -ESPIPE;
+diff --git a/mm/memory.c b/mm/memory.c
+index b59ae7ce42eb..0d573e633c36 100644
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -5698,6 +5698,11 @@ static vm_fault_t do_read_fault(struct vm_fault *vmf)
+ 	vm_fault_t ret = 0;
+ 	struct folio *folio;
+ 
++#ifdef CONFIG_PAGE_CACHE_ISOLATION_TRACING
++	pr_debug("%s: called from (%s/%d) for %s\n", __func__, current ? current->comm : "?",
++			current ? current->pid : 0, vmf->vma->vm_file->f_path.dentry->d_name.name);
++#endif
++
+ 	/*
+ 	 * Let's call ->map_pages() first and use ->fault() as fallback
+ 	 * if page by the offset is not ready to be mapped (cold cache or
+diff --git a/mm/readahead.c b/mm/readahead.c
+index ee5dce4505c6..d30d949f7c32 100644
+--- a/mm/readahead.c
++++ b/mm/readahead.c
+@@ -118,6 +118,7 @@
+ #include "linux/maple_tree.h"
+ #include "linux/mm.h"
+ #include "linux/pid.h"
++#include "linux/printk.h"
+ #include "linux/xarray.h"
+ #include <linux/blkdev.h>
+ #include <linux/kernel.h>
+@@ -710,6 +711,11 @@ ssize_t ksys_readahead(int fd, loff_t offset, size_t count)
+ 	struct file *file;
+ 	const struct inode *inode;
+ 
++#ifdef CONFIG_PAGE_CACHE_ISOLATION_TRACING
++	pr_debug("%s: called from (%s/%d) for FD %d\n", __func__, current ? current->comm : "?",
++			current ? current->pid : 0, fd);
++#endif
++
+ 	CLASS(fd, f)(fd);
+ 	if (fd_empty(f))
+ 		return -EBADF;
+-- 
+2.55.0
+

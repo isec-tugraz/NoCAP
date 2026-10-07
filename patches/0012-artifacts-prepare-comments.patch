@@ -1,0 +1,199 @@
+From a04b74ce9cc6ae68605818fb33c4a485649522c6 Mon Sep 17 00:00:00 2001
+From: Marcell Matthias Haritopoulos <marcell.haritopoulos@student.tugraz.at>
+Date: Fri, 7 Aug 2026 13:02:59 +0200
+Subject: [PATCH 12/13] artifacts: prepare comments
+
+---
+ fs/aio.c        |  6 +++++
+ fs/read_write.c | 13 +++++++++++
+ io_uring/rw.c   | 10 ++++++++
+ mm/fadvise.c    | 10 ++++++++
+ mm/filemap.c    | 61 +++++++++++++++++++++++++++++++++++++++++++++++++
+ 5 files changed, 100 insertions(+)
+
+diff --git a/fs/aio.c b/fs/aio.c
+index 5bc133386407..15a0695e6d07 100644
+--- a/fs/aio.c
++++ b/fs/aio.c
+@@ -1599,6 +1599,12 @@ static int aio_read(struct kiocb *req, const struct iocb *iocb,
+ 	if (ret < 0)
+ 		return ret;
+ 	ret = rw_verify_area(READ, file, &req->ki_pos, iov_iter_count(&iter));
++	/*
++	 * NOCAP!: The AIO implementation here calls into the fops `read_iter`, which,
++	 * as discussed in the `read` syscall comment, this calls into the
++	 * page cache implementation via `generic_file_read_iter`.
++	 * Thus AIO is covered by the page cache isolation implementation
++	 */
+ 	if (!ret)
+ 		aio_rw_done(req, file->f_op->read_iter(req, &iter));
+ 	kfree(iovec);
+diff --git a/fs/read_write.c b/fs/read_write.c
+index 833bae068770..c907e7f1c9f3 100644
+--- a/fs/read_write.c
++++ b/fs/read_write.c
+@@ -566,6 +566,19 @@ ssize_t vfs_read(struct file *file, char __user *buf, size_t count, loff_t *pos)
+ 	if (count > MAX_RW_COUNT)
+ 		count =  MAX_RW_COUNT;
+ 
++	/*
++	 * NOCAP!: For normal reads, this is the entry point from read
++	 * -> ksys_read -> vfs_read.
++	 *
++	 *  A lot of FS do not have a `read` `f_op` (e.g. searching `static const struct file_operations`,
++	 *  and mostly for pseudo-FS.
++	 *  For most FS, the call chain continues with new_sync_read, which uses the `read_iter` fops.
++	 *  Here, function `generic_file_read_iter` is must commonly either directly used,
++	 *  or called after checking whether performing some shortcuts is possible.
++	 *
++	 *  As long as the file is not O_DIRECT, the code path further enters the page cache
++	 *  code path via `filemap_read`.
++	 */
+ 	if (file->f_op->read)
+ 		ret = file->f_op->read(file, buf, count, pos);
+ 	else if (file->f_op->read_iter)
+diff --git a/io_uring/rw.c b/io_uring/rw.c
+index abe68ba9c9dc..f5f757f136d0 100644
+--- a/io_uring/rw.c
++++ b/io_uring/rw.c
+@@ -833,6 +833,16 @@ static inline int io_iter_do_read(struct io_rw *rw, struct iov_iter *iter)
+ {
+ 	struct file *file = rw->kiocb.ki_filp;
+ 
++
++	/*
++	 * NOCAP!: The IO-uring implementation here calls into the fops `read_iter`, which,
++	 * as discussed in the `read` syscall comment, this calls into the
++	 * page cache implementation via `generic_file_read_iter`.
++	 * It is called by __io_read, which itself calls this function when using the 
++	 * IORING_OP_READ
++	 *
++	 * Thus IO-uring is covered by the page cache isolation implementation
++	 */
+ 	if (likely(file->f_op->read_iter))
+ 		return file->f_op->read_iter(&rw->kiocb, iter);
+ 	else if (file->f_op->read)
+diff --git a/mm/fadvise.c b/mm/fadvise.c
+index 436c9db7ef52..8a1472f5b1e7 100644
+--- a/mm/fadvise.c
++++ b/mm/fadvise.c
+@@ -182,6 +182,16 @@ int generic_fadvise(struct file *file, loff_t offset, loff_t len, int advice)
+ 						end_index);
+ 			}
+ 
++			/*
++			 * NOCAP!: This is the part in posix_fadvice that implements the
++			 * flush delay. It is located only in the POSIX_FADV_DONTNEED code
++			 * path and uses the linear function specified by the calibration
++			 * linear regression result.
++			 *
++			 * Clearing the bits is not directly visible here in the fadvise code,
++			 * but is located in `mm/filemap.c:page_cache_delete`, which is part
++			 * of the call tree of mapping_try_invalidate
++			 */
+ #ifdef CONFIG_PAGE_CACHE_ISOLATION_DELAYED_FADV_DONTNEED
+ 			unsigned long real_end_index;
+ 
+diff --git a/mm/filemap.c b/mm/filemap.c
+index 5aefafe0fba7..325a800db571 100644
+--- a/mm/filemap.c
++++ b/mm/filemap.c
+@@ -179,6 +179,26 @@ static int filemap_get_access_bits_struct(struct address_space *mapping,
+ 
+ 	*out = NULL;
+ 
++	/*
++	 * NOCAP!: For distinguishing between participants, we opted for the
++	 * task's mm_struct instance as the key.
++	 * Different tasks may share the same mm_struct (e.g. threads or
++	 * using CLONE_VM). We do not want to incur the first-time seen penalty
++	 * across thread of the same process.
++	 * Additionally, with no security boundary in terms of virtual memory,
++	 * the mitigation provided by NoCAP is moot for such tasks.
++	 *
++	 * An open implementation detail is how to perform garbage collection:
++	 * mm_struct and inodes (which contains the address_space hosting the folios in the page cache)
++	 * have vastly different lifetimes which makes cleanup from one or the other side hard:
++	 * Inodes are not aware by which tasks they are used and do not know when a mm_struct is destroyed,
++	 * to clean up the resources.
++	 * mm_structs are also not aware of which inodes were used in its address space over its
++	 * entire lifetime. We cannot clear the resources when a task closes the FILE* because other
++	 * tasks with the same mm_struct may still have an instance opened to it _and_ the first-time
++	 * seen bitmask should still be retained when all file references were closed and it is re-opened
++	 * (while still keeping track of flushed out folios)
++	 */
+ 	key = (size_t)mm & ULONG_MAX; // TODO!
+ 
+ 	// Try to acquire the xarray based on the mm
+@@ -215,6 +235,15 @@ static int filemap_get_access_bits_struct(struct address_space *mapping,
+ 		}
+ 	} else if (mm && access) {
+ 
++		/*
++		 * NOCAP!: As a consequence of not being able to garbage-collect the
++		 * bitmask data when an mm_struct was destroyed we need a token
++		 * to distinguish between multiple incarnations of the same instance.
++		 *
++		 * mm_struct instances are part of a memory pool via kmem_cache. Thus,
++		 * a new incarnation of a mm_struct with the same memory location is
++		 * very likely to happen.
++		 */
+ 		if (access->mm_token != mm->filemap_token) {
+ 			// Check if the mm token matches - otherwise it has been
+ 			// recycled and should be treated like new
+@@ -348,6 +377,14 @@ static void page_cache_delete(struct address_space *mapping,
+ 	xas_store(&xas, shadow);
+ 	xas_init_marks(&xas);
+ 
++	/*
++	 * NOCAP!: When a folio is removed from the page cache,
++	 * we need to clear the first-time-seen bit from all
++	 * participants. As the folio is no longer here, it is not
++	 * "visible" to all participants anymore and needs to be "seen" first
++	 * by each one individually, so the first access to the folio after a
++	 * flush incurs a mimicked I/O operation again.
++	 */
+ #ifdef CONFIG_PAGE_CACHE_ISOLATION
+ 	mapping_clear_accessed_bits(mapping, folio);
+ #endif /* CONFIG_PAGE_CACHE_ISOLATION */
+@@ -1208,6 +1245,14 @@ int filemap_add_folio(struct address_space *mapping, struct folio *folio,
+ 					    NR_KERNEL_FILE_PAGES,
+ 					    folio_nr_pages(folio));
+ 
++		/*
++		 * NOCAP!: Setting the "seen" bit here is a bit unintuitive.
++		 * However, when a synchronous/asynchronous readahead is performed,
++		 * the readahead code allocates and fills the address_space with those
++		 * folios using `filemap_add_folio`. The participant that calls
++		 * filemap_add_folio has thus "seen" the folio as it does prepare to do
++		 * the _actual_ read from disk.
++		 */
+ #ifdef CONFIG_PAGE_CACHE_ISOLATION
+ 		filemap_set_accessed_bits(mapping, current->mm, index, folio_nr_pages(folio));
+ #endif /* CONFIG_PAGE_CACHE_ISOLATION */
+@@ -3140,6 +3185,22 @@ static int filemap_access_delay_task(void) {
+ #endif /* !CONFIG_PAGE_CACHE_ISOLATION_MIMIC_IO */
+ #endif /* CONFIG_PAGE_CACHE_ISOLATION */
+ 
++/*
++ * NOCAP!: filemap_get_pages is the most critical function for the
++ * workings of NoCAP. This is the function that queries the available
++ * folios in the page cache (up to count folios), 
++ * performing synchronous readaheads when the
++ * folios at the iterator position are not present in the page cache, 
++ * or issuing asynchronous readaheads when folios were in cache and the
++ * readahead bit was encountered.
++ *
++ * NoCAP hooks into the codepath when the request can be satisfied by the
++ * page cache. In this case we look up in the first-time-seen bitfield whether
++ * all folios of the request are "visible" to the requester mm_struct.
++ * If not, an synchronous readahead is performed to cause real I/O load, but the
++ * result is discarded. As the folios were "seen" by this operation, the bits in the
++ * bitfields are set.
++ */
+ static int filemap_get_pages(struct kiocb *iocb, size_t count,
+ 		struct folio_batch *fbatch, bool need_uptodate)
+ {
+-- 
+2.55.0
+

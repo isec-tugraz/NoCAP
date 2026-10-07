@@ -1,0 +1,103 @@
+From 9cc8c9be77138c9895b95093f970801b73de2417 Mon Sep 17 00:00:00 2001
+From: Marcell Haritopoulos <marcellharitopoulos@gmail.com>
+Date: Fri, 31 Jan 2025 05:28:26 +0100
+Subject: [PATCH 02/13] address_space: add per-mm page accessed bits
+
+For all the pages that are associated to a address_space we need to
+maintain a bitfield that indicates that a page that is in the page cache
+has been used by a task or not. The maple tree will hold XArrays for
+each tasks to track these accesses.
+---
+ fs/inode.c         | 25 +++++++++++++++++++++++++
+ include/linux/fs.h |  4 ++++
+ 2 files changed, 29 insertions(+)
+
+diff --git a/fs/inode.c b/fs/inode.c
+index 2c55ec49b023..f1f8a3e7848d 100644
+--- a/fs/inode.c
++++ b/fs/inode.c
+@@ -3,6 +3,7 @@
+  * (C) 1997 Linus Torvalds
+  * (C) 1999 Andrea Arcangeli <andrea@suse.de> (dynamic inode allocation)
+  */
++#include "linux/maple_tree.h"
+ #include <linux/export.h>
+ #include <linux/fs.h>
+ #include <linux/filelock.h>
+@@ -209,6 +210,10 @@ static int __init init_fs_inode_sysctls(void)
+ early_initcall(init_fs_inode_sysctls);
+ #endif
+ 
++#ifdef CONFIG_PAGE_CACHE_ISOLATION
++static void address_space_free(struct address_space *mapping);
++#endif
++
+ static int no_open(struct inode *inode, struct file *file)
+ {
+ 	return -ENXIO;
+@@ -321,6 +326,11 @@ EXPORT_SYMBOL(free_inode_nonrcu);
+ static void i_callback(struct rcu_head *head)
+ {
+ 	struct inode *inode = container_of(head, struct inode, i_rcu);
++
++#ifdef CONFIG_PAGE_CACHE_ISOLATION
++	address_space_free(inode->i_mapping);
++#endif
++
+ 	if (inode->free_inode)
+ 		inode->free_inode(inode);
+ 	else
+@@ -482,6 +492,9 @@ EXPORT_SYMBOL(inc_nlink);
+ static void __address_space_init_once(struct address_space *mapping)
+ {
+ 	xa_init_flags(&mapping->i_pages, XA_FLAGS_LOCK_IRQ | XA_FLAGS_ACCOUNT);
++#ifdef CONFIG_PAGE_CACHE_ISOLATION
++	mt_init_flags(&mapping->i_mm_access_bits, MT_FLAGS_LOCK_IRQ);
++#endif /* CONFIG_PAGE_CACHE_ISOLATION */
+ 	init_rwsem(&mapping->i_mmap_rwsem);
+ 	INIT_LIST_HEAD(&mapping->i_private_list);
+ 	spin_lock_init(&mapping->i_private_lock);
+@@ -495,6 +508,18 @@ void address_space_init_once(struct address_space *mapping)
+ }
+ EXPORT_SYMBOL(address_space_init_once);
+ 
++#ifdef CONFIG_PAGE_CACHE_ISOLATION
++static void address_space_free(struct address_space *mapping) {
++	struct xarray *arr;
++	unsigned long idx;
++	mt_for_each(&mapping->i_mm_access_bits, arr, idx, ULONG_MAX) {
++		xa_destroy(arr);
++		kfree(arr);
++	}
++	mtree_destroy(&mapping->i_mm_access_bits);
++}
++#endif /* CONFIG_PAGE_CACHE_ISOLATION */
++
+ /*
+  * These are initializations that only need to be done
+  * once, because the fields are idempotent across use
+diff --git a/include/linux/fs.h b/include/linux/fs.h
+index dd3b57cfadee..a57e3d716627 100644
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -502,6 +502,7 @@ extern const struct address_space_operations empty_aops;
+  * @i_private_lock: For use by the owner of the address_space.
+  * @i_private_list: For use by the owner of the address_space.
+  * @i_private_data: For use by the owner of the address_space.
++ * @i_mm_access_bits: Per-MM bitfields of accessed pages.
+  */
+ struct address_space {
+ 	struct inode		*host;
+@@ -523,6 +524,9 @@ struct address_space {
+ 	struct list_head	i_private_list;
+ 	struct rw_semaphore	i_mmap_rwsem;
+ 	void *			i_private_data;
++#ifdef CONFIG_PAGE_CACHE_ISOLATION
++	struct maple_tree	i_mm_access_bits;
++#endif /* CONFIG_PAGE_CACHE_ISOLATION */
+ } __attribute__((aligned(sizeof(long)))) __randomize_layout;
+ 	/*
+ 	 * On most architectures that alignment is already the case; but
+-- 
+2.55.0
+

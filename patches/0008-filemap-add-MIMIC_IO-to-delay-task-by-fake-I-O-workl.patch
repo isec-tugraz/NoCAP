@@ -1,0 +1,397 @@
+From 6f4accfe405952f90b9602d0483991879224857d Mon Sep 17 00:00:00 2001
+From: Marcell Matthias Haritopoulos <marcell.haritopoulos@student.tugraz.at>
+Date: Fri, 7 Aug 2026 05:19:38 +0200
+Subject: [PATCH 08/13] filemap: add MIMIC_IO to delay task by fake I/O
+ workload
+
+The fixed-delay based approach of delaying the task is a bit
+problematic:
+On an ideal disk, we would need some calibration for the I/O overhead of
+"reading" data from the disk.
+However, disks are not ideal: internal caching, fragmentation,
+networked FS', LVM, ... all won't play nicely with one simple
+calibration.
+Also, without performing I/O but a simple delay, there is no disk
+utilization happening, so if the attacker can monitor the disk
+utilization, this may leak the page cache state once again.
+So instead MIMIC_IO actually performs a sync readahead on the requested
+folios.
+---
+ include/linux/pagemap.h |   6 ++
+ mm/Kconfig              |  16 +++++
+ mm/filemap.c            | 143 +++++++++++++++++++++++++++++++++-------
+ mm/readahead.c          |  86 ++++++++++++++++++++++++
+ 4 files changed, 229 insertions(+), 22 deletions(-)
+
+diff --git a/include/linux/pagemap.h b/include/linux/pagemap.h
+index 207998e6f5cb..827bfcd8fbe9 100644
+--- a/include/linux/pagemap.h
++++ b/include/linux/pagemap.h
+@@ -1366,6 +1366,12 @@ void readahead_expand(struct readahead_control *ractl,
+ 
+ 
+ #ifdef CONFIG_PAGE_CACHE_ISOLATION
++int readahead_set_accessed_bits_async(struct kiocb *iocb, struct file *filp,
++		struct address_space *mapping, struct folio *folio,
++		pgoff_t last_index, size_t *non_accessed_folios);
++int readahead_mimic_sync(struct address_space *mapping, struct file *filp,
++		unsigned long index, unsigned int count);
++
+ struct access_bits_struct {
+ 	unsigned long mm_token;
+ 	struct xarray bits_arr;
+diff --git a/mm/Kconfig b/mm/Kconfig
+index 545951f2c0b7..5be03abc6c38 100644
+--- a/mm/Kconfig
++++ b/mm/Kconfig
+@@ -1393,6 +1393,25 @@ config PAGE_CACHE_ISOLATION
+ 	  clear and it did not initialize the readahead), the task is
+ 	  delayed synthetically to mimic a page cache miss and readahead.
+ 
++if PAGE_CACHE_ISOLATION
++config PAGE_CACHE_ISOLATION_MIMIC_IO
++	bool "block i/o based task delay"
++	default n
++	depends on PAGE_CACHE_ISOLATION
++	help
++	  Delays a task by actually posting a readahead to the block subsystem.
++	  If not enabled, the task is delayed for a randomized delay.
++
++	  While this causes work for the block disk and all involved buses (and
++	  will likely consume more power), this is the more accurate variant of
++	  the isolation and will make the isolation less noticable (for an
++	  attacker and the user)
++
++	  WARNING: the asynchronous MIMIC_IO path is experimental and currently
++	  crashes. It is defaulted off for this reason. Do not enable it unless
++	  you are debugging that path.
++
++endif # PAGE_CACHE_ISOLATION
++
+ source "mm/damon/Kconfig"
+ 
+ endmenu
+diff --git a/mm/filemap.c b/mm/filemap.c
+index e8a88aee26fc..95ee20e8bf50 100644
+--- a/mm/filemap.c
++++ b/mm/filemap.c
+@@ -227,7 +227,7 @@ static int _filemap_set_accessed_bits(struct xarray *bits_arr,
+ 	pgoff_t pg_idx;
+ 	unsigned long bitfield;
+ 	unsigned long mask;
+-	void* field_dat;
++	void *current_arr_val, *next_arr_val;
+ 
+ 	if (non_accessed_folios)
+ 		*non_accessed_folios = 0;
+@@ -235,27 +235,35 @@ static int _filemap_set_accessed_bits(struct xarray *bits_arr,
+ 	for (pg_bit = start; pg_bit < start + len; pg_bit++) {
+ 		pg_idx = pg_bit / sizeof(unsigned long);
+ 
+-		xa_lock_irq(bits_arr);
+-
+-		field_dat = xa_load(bits_arr, pg_idx);
+-		if (xa_is_value(field_dat)) {
+-			bitfield = xa_to_value(field_dat);
+-		} else {
+-			bitfield = 0;
+-		}
++		while (1) {
++			current_arr_val = xa_load(bits_arr, pg_idx);
++			if (xa_is_value(current_arr_val)) {
++				bitfield = xa_to_value(current_arr_val);
++			} else {
++				bitfield = 0;
++			}
+ 
+-		mask = (1 << (pg_bit % sizeof(unsigned long)));
+-		if (!(bitfield & mask)) {
+-			bitfield |= mask;
+-			if (non_accessed_folios)
+-				*non_accessed_folios += 1;
+-			field_dat = __xa_store(bits_arr, pg_idx, xa_mk_value(bitfield), GFP_KERNEL);
+-		}
++			mask = (1 << (pg_bit % sizeof(unsigned long)));
++			if (!(bitfield & mask)) {
++				bitfield |= mask;
+ 
+-		xa_unlock_irq(bits_arr);
++				next_arr_val = xa_cmpxchg(bits_arr, pg_idx, current_arr_val, xa_mk_value(bitfield), GFP_KERNEL);
++				if (xa_err(next_arr_val)) {
++					return xa_err(next_arr_val);
++				}
+ 
+-		if (xa_err(field_dat)) {
+-			return xa_err(field_dat);
++				/*
++				 * cmpxchg succeeded if the returned previous content of the xarray (next_arr_val) is equal to
++				 * the supposed previous content of the xarray, else retry
++				 */
++				if (current_arr_val == next_arr_val) {
++					if (non_accessed_folios)
++						*non_accessed_folios += 1;
++					break;
++				}
++			} else {
++				break;
++			}
+ 		}
+ 	}
+ 
+@@ -2771,8 +2779,9 @@ static int filemap_readahead(struct kiocb *iocb, struct file *file,
+ 
+ 
+ #ifdef CONFIG_PAGE_CACHE_ISOLATION
++#ifndef CONFIG_PAGE_CACHE_ISOLATION_MIMIC_IO
+ static int filemap_set_accessed_bits_fbatch(struct address_space *mapping,
+-		struct folio_batch *fbatch, struct mm_struct *mm, 
++		struct folio_batch *fbatch, struct mm_struct *mm,
+ 		size_t *non_accessed_folios)
+ {
+ 	int i, ret;
+@@ -2801,7 +2810,71 @@ static int filemap_set_accessed_bits_fbatch(struct address_space *mapping,
+ 
+ 	return 0;
+ }
++#else
++static int _filemap_test_accessed_bits(struct xarray *bits_arr,
++		off_t start, off_t len, size_t *non_accessed_folios)
++{
++	off_t pg_bit;
++	pgoff_t pg_idx;
++	unsigned long bitfield;
++	unsigned long mask;
++	void* field_dat;
++
++	if (!non_accessed_folios)
++		return -EINVAL;
++
++	*non_accessed_folios = 0;
++
++	for (pg_bit = start; pg_bit < start + len; pg_bit++) {
++		pg_idx = pg_bit / sizeof(unsigned long);
+ 
++		field_dat = xa_load(bits_arr, pg_idx);
++		if (xa_is_value(field_dat)) {
++			bitfield = xa_to_value(field_dat);
++		} else {
++			bitfield = 0;
++		}
++
++		mask = (1 << (pg_bit % sizeof(unsigned long)));
++		if (!(bitfield & mask)) {
++			*non_accessed_folios += 1;
++		}
++	}
++
++	return 0;
++}
++static int filemap_test_accessed_bits_fbatch(struct address_space *mapping,
++		struct folio_batch *fbatch, struct mm_struct *mm,
++		size_t *non_accessed_folios)
++{
++	int ret;
++	int i;
++	size_t idx, cnt;
++	size_t folio_non_accessed;
++	struct xarray *bits_arr;
++
++	*non_accessed_folios = 0;
++
++	ret = filemap_get_access_bitmask(mapping, mm, &bits_arr);
++	if (ret)
++		return ret;
++
++	for (i = 0; i < folio_batch_count(fbatch); i++) {
++		idx = folio_index(fbatch->folios[i]);
++		cnt = folio_nr_pages(fbatch->folios[i]);
++
++		ret = _filemap_test_accessed_bits(bits_arr, idx, cnt, &folio_non_accessed);
++		if (ret)
++			return ret;
++
++		*non_accessed_folios += folio_non_accessed;
++	}
++
++	return ret;
++}
++#endif
++
++#ifndef CONFIG_PAGE_CACHE_ISOLATION_MIMIC_IO
+ static int filemap_access_delay_task(void) {
+ 	/* TASK_UNINTERRUPTIBLE mimics how I/O blocks the task */
+ 	/* TODO: Maybe we have to check rest jiffies? */
+@@ -2814,7 +2887,8 @@ static int filemap_access_delay_task(void) {
+ 	schedule_timeout_uninterruptible(usecs_to_jiffies(delay));
+ 	return 0;
+ }
+-#endif
++#endif /* !CONFIG_PAGE_CACHE_ISOLATION_MIMIC_IO */
++#endif /* CONFIG_PAGE_CACHE_ISOLATION */
+ 
+ static int filemap_get_pages(struct kiocb *iocb, size_t count,
+ 		struct folio_batch *fbatch, bool need_uptodate)
+@@ -2859,8 +2933,20 @@ static int filemap_get_pages(struct kiocb *iocb, size_t count,
+ 		return err;
+ 	}
+ 
++
++
+ 	folio = fbatch->folios[folio_batch_count(fbatch) - 1];
+ 	if (folio_test_readahead(folio)) {
++#ifdef CONFIG_PAGE_CACHE_ISOLATION
++#ifdef CONFIG_PAGE_CACHE_ISOLATION_MIMIC_IO
++		// We do not need to handle sync ra above - it only triggers if nothing
++		// is in the page cache and will trigger marking a bit by allocation
++		// Async readahead, though, needs to be handled
++		err = readahead_set_accessed_bits_async(iocb, filp, mapping, folio, last_index, &non_accessed_folios);
++		if (err)
++			goto err;
++#endif /* !CONFIG_PAGE_CACHE_ISOLATION_MIMIC_IO */
++#endif /* CONFIG_PAGE_CACHE_ISOLATION */
+ 		err = filemap_readahead(iocb, filp, mapping, folio, last_index);
+ 		if (err)
+ 			goto err;
+@@ -2877,17 +2963,30 @@ static int filemap_get_pages(struct kiocb *iocb, size_t count,
+ 	}
+ 
+ #ifdef CONFIG_PAGE_CACHE_ISOLATION
+-	/* Mark the folios as accessed to the  */
++#ifndef CONFIG_PAGE_CACHE_ISOLATION_MIMIC_IO
++	/* Set and immediately test for non-accessed folios */
+ 	err = filemap_set_accessed_bits_fbatch(mapping, fbatch, current->mm, &non_accessed_folios);
+ 	if (err)
+ 		goto err;
++#else /* !CONFIG_PAGE_CACHE_ISOLATION_MIMIC_IO */
++	/* Test if any of the acquired folios were ever accessed */
++	err = filemap_test_accessed_bits_fbatch(mapping, fbatch, current->mm, &non_accessed_folios);
++	if (err)
++		goto err;
++#endif /* CONFIG_PAGE_CACHE_ISOLATION_MIMIC_IO */
+ 
+ 	/*
+ 	 * naive approach - as soon as one folio was not yet accessed
+ 	 * after a flush, block the task.
+ 	 */
+ 	if (non_accessed_folios && !mapping_unevictable(mapping)) {
++#ifdef CONFIG_PAGE_CACHE_ISOLATION_MIMIC_IO
++		pr_debug("filemap_get_pages: mimicing sync readahead: mapping=%p, filp=%p\n",
++				mapping, filp);
++		readahead_mimic_sync(mapping, filp, index, count);
++#else
+ 		filemap_access_delay_task();
++#endif /* CONFIG_PAGE_CACHE_ISOLATION_MIMIC_IO */
+ 	}
+ #endif /* CONFIG_PAGE_CACHE_ISOLATION */
+ 
+diff --git a/mm/readahead.c b/mm/readahead.c
+index 3a4b5d58eeb6..925e6d863069 100644
+--- a/mm/readahead.c
++++ b/mm/readahead.c
+@@ -113,6 +113,11 @@
+  * ->read_folio() which may be less efficient.
+  */
+ 
++#include "linux/fs.h"
++#include "linux/kern_levels.h"
++#include "linux/mm.h"
++#include "linux/pid.h"
++#include "linux/xarray.h"
+ #include <linux/blkdev.h>
+ #include <linux/kernel.h>
+ #include <linux/dax.h>
+@@ -128,6 +133,7 @@
+ #include <linux/blk-cgroup.h>
+ #include <linux/fadvise.h>
+ #include <linux/sched/mm.h>
++#include "swap.h"
+ 
+ #define CREATE_TRACE_POINTS
+ #include <trace/events/readahead.h>
+@@ -836,3 +842,83 @@ void readahead_expand(struct readahead_control *ractl,
+ 	}
+ }
+ EXPORT_SYMBOL(readahead_expand);
++
++#ifdef CONFIG_PAGE_CACHE_ISOLATION
++#ifdef CONFIG_PAGE_CACHE_ISOLATION_MIMIC_IO
++int readahead_mimic_sync(struct address_space *mapping, struct file *filp,
++		unsigned long index, unsigned int count)
++{
++	// Create a dummy mapping where we can place the dummy read
++	// folio in
++
++	struct address_space fake_mapping;
++	address_space_init_once(&fake_mapping);
++
++	// TODO: Get/put a_ops?
++	fake_mapping.a_ops = mapping->a_ops;
++	fake_mapping.host = mapping->host;
++	fake_mapping.flags = mapping->flags;
++	fake_mapping.wb_err = mapping->wb_err;
++	atomic_set(&fake_mapping.i_mmap_writable, atomic_read(&mapping->i_mmap_writable));
++#ifdef CONFIG_READ_ONLY_THP_FOR_FS
++	atomic_set(&fake_mapping.nr_thps, atomic_read(&mapping->nr_thps));
++#endif
++	fake_mapping.gfp_mask = mapping->gfp_mask;
++	fake_mapping.nrpages = mapping->nrpages;
++	fake_mapping.i_private_data =  mapping->i_private_data;
++	fake_mapping.writeback_index = mapping->writeback_index;
++	init_rwsem(&mapping->invalidate_lock);
++
++
++	DEFINE_READAHEAD(ractl, filp, &filp->f_ra, &fake_mapping, index);
++
++	page_cache_sync_ra(&ractl, count);
++	filemap_set_accessed_bits(mapping, current->mm, index, filp->f_ra.size);
++
++	WARN_ON(xa_empty(&fake_mapping.i_pages));
++
++	unsigned long idx;
++	struct folio *entry;
++	xa_for_each(&fake_mapping.i_pages, idx, entry) {
++
++	}
++
++	//folio_wait_locked(folio);
++	truncate_inode_pages(&fake_mapping, index);
++
++	BUG_ON(!xa_empty(&fake_mapping.i_pages));
++	xa_destroy(&fake_mapping.i_pages);
++	mtree_destroy(&fake_mapping.i_mm_access_bits);
++
++	return 0;
++}
++#endif /* CONFIG_PAGE_CACHE_ISOLATION_MIMIC_IO */
++
++int readahead_set_accessed_bits_async(struct kiocb *iocb, struct file *filp,
++		struct address_space *mapping, struct folio *folio,
++		pgoff_t last_index, size_t *non_accessed_folios)
++{
++	// We'll take the old state, and apply the async readahead state to our bitfield
++	// The ra_state is in the file struct, and thus per-task.
++	struct file_ra_state *ra = &filp->f_ra;
++
++	pr_debug("%s: starting accessed readahead: %p %s/%d\n", __func__, mapping, current->comm, task_pid_nr(current));
++
++	rcu_read_lock();
++	XA_STATE(xas, &mapping->i_pages, ra->start + (ra->size - ra->async_size));
++
++	while (xas.xa_index < ra->start + ra->size && xas.xa_index >= ra->start) {
++		struct folio *entry = xas_next(&xas);
++		if (!entry || xa_is_value(entry))
++			continue;
++
++		pr_debug("%s:    %p: idx=%lu, cnt=%lu %s/%d\n", __func__, mapping, folio_index(entry), folio_nr_pages(entry), current->comm, task_pid_nr(current));
++		filemap_set_accessed_bits(mapping, current->mm, folio_index(entry), folio_nr_pages(entry));
++	}
++
++	rcu_read_unlock();
++
++
++	return 0;
++}
++#endif /* CONFIG_PAGE_CACHE_ISOLATION */
+-- 
+2.55.0
+

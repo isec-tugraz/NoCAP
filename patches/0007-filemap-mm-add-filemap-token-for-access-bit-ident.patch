@@ -1,0 +1,231 @@
+From c8491e3f462295d001c19c3e2f51c6d5fca8cab4 Mon Sep 17 00:00:00 2001
+From: Marcell Matthias Haritopoulos <marcell.haritopoulos@student.tugraz.at>
+Date: Sun, 21 Dec 2025 05:49:18 +0100
+Subject: [PATCH 07/13] filemap: mm: add filemap token for access bit ident
+
+struct mm are usually recycled by the kernel and the information about
+the first-time access bits is kept inside the struct mapping themselves.
+When the last task that is using a certain struct mm is closed, it is
+hard to clean up the bitmap from all mappings the task ever touched.
+Most of the fds will be closed already and there might be some other
+tasks with the same mm opening different fds.
+Tracking which files we had opened is also a bit cumbersome because the
+mapping does not have an association to the mms that reference it right
+now, so keeping a list of mappings that an mm ever opened and removing a
+mapping on-demand if we are completely done is also problematic.
+
+To combat this the easy way, just introduce a token into the mm and use
+it for the first-time access bitfield. This way, if the mapping is
+re-used, all bitfields are just discarded there and if the mm is
+re-used, a new token will invalidate the existing bitfield (with a
+chance of collision of 2^(-64)).
+
+The problem with this approach is unfortunately that as long as the
+mapping exists, for each mm that used the file, the bitfield's memory
+will be retained. This can be an enormous memory drain, considering
+files that experience a lot of sharing like libc.
+---
+ fs/inode.c               |  4 +--
+ include/linux/mm_types.h |  3 ++
+ include/linux/pagemap.h  |  9 ++++++
+ kernel/fork.c            |  5 ++++
+ mm/filemap.c             | 65 +++++++++++++++++++++++-----------------
+ 5 files changed, 57 insertions(+), 29 deletions(-)
+
+diff --git a/fs/inode.c b/fs/inode.c
+index f1f8a3e7848d..5c873bb7f65b 100644
+--- a/fs/inode.c
++++ b/fs/inode.c
+@@ -510,10 +510,10 @@ EXPORT_SYMBOL(address_space_init_once);
+ 
+ #ifdef CONFIG_PAGE_CACHE_ISOLATION
+ static void address_space_free(struct address_space *mapping) {
+-	struct xarray *arr;
++	struct access_bits_struct *arr;
+ 	unsigned long idx;
+ 	mt_for_each(&mapping->i_mm_access_bits, arr, idx, ULONG_MAX) {
+-		xa_destroy(arr);
++		xa_destroy(&arr->bits_arr);
+ 		kfree(arr);
+ 	}
+ 	mtree_destroy(&mapping->i_mm_access_bits);
+diff --git a/include/linux/mm_types.h b/include/linux/mm_types.h
+index 90e5790c318f..093abe35a932 100644
+--- a/include/linux/mm_types.h
++++ b/include/linux/mm_types.h
+@@ -1227,6 +1227,9 @@ struct mm_struct {
+ #ifdef CONFIG_MM_ID
+ 		mm_id_t mm_id;
+ #endif /* CONFIG_MM_ID */
++#ifdef CONFIG_PAGE_CACHE_ISOLATION
++		unsigned long filemap_token;
++#endif /* CONFIG_PAGE_CACHE_ISOLATION */
+ 	} __randomize_layout;
+ 
+ 	/*
+diff --git a/include/linux/pagemap.h b/include/linux/pagemap.h
+index 70d4b461621f..207998e6f5cb 100644
+--- a/include/linux/pagemap.h
++++ b/include/linux/pagemap.h
+@@ -1364,6 +1364,15 @@ void page_cache_async_ra(struct readahead_control *, struct folio *,
+ void readahead_expand(struct readahead_control *ractl,
+ 		      loff_t new_start, size_t new_len);
+ 
++
++#ifdef CONFIG_PAGE_CACHE_ISOLATION
++struct access_bits_struct {
++	unsigned long mm_token;
++	struct xarray bits_arr;
++};
++#endif /* CONFIG_PAGE_CACHE_ISOLATION */
++
++
+ /**
+  * page_cache_sync_readahead - generic file readahead
+  * @mapping: address_space which holds the pagecache and I/O vectors
+diff --git a/kernel/fork.c b/kernel/fork.c
+index 3da0f08615a9..bebacbd35927 100644
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -1089,6 +1089,11 @@ static struct mm_struct *mm_init(struct mm_struct *mm, struct task_struct *p,
+ 
+ 	mm->user_ns = get_user_ns(user_ns);
+ 	lru_gen_init_mm(mm);
++
++#ifdef CONFIG_PAGE_CACHE_ISOLATION
++	mm->filemap_token = get_random_long();
++#endif /* CONFIG_PAGE_CACHE_ISOLATION */
++
+ 	return mm;
+ 
+ fail_pcpu:
+diff --git a/mm/filemap.c b/mm/filemap.c
+index 777470346861..e8a88aee26fc 100644
+--- a/mm/filemap.c
++++ b/mm/filemap.c
+@@ -10,6 +10,8 @@
+  * most "normal" filesystems (but you don't /have/ to use this:
+  * the NFS filesystem used to do this differently, for example)
+  */
++#include "asm-generic/delay.h"
++#include "linux/blkdev.h"
+ #include "linux/debug_locks.h"
+ #include "linux/err.h"
+ #include "linux/gfp_types.h"
+@@ -132,11 +134,12 @@
+  *    ->private_lock		(zap_pte_range->block_dirty_folio)
+  */
+ 
++
+ #ifdef CONFIG_PAGE_CACHE_ISOLATION
+ static void mapping_clear_accessed_bits(struct address_space *mapping,
+                    struct folio *folio)
+ {
+-   struct xarray *bits_arr;
++   struct access_bits_struct *access;
+    unsigned long bitfield, old;
+    unsigned long key = 0;
+    pgoff_t pg_idx;
+@@ -144,29 +147,23 @@ static void mapping_clear_accessed_bits(struct address_space *mapping,
+    int i;
+ 
+ 
+-   mt_for_each(&mapping->i_mm_access_bits, bits_arr, key, ULONG_MAX) {
+-       pr_info("mapping_clear_accessed_bits:   bf key=%lx, bf=%p", key, bits_arr);
++	mt_for_each(&mapping->i_mm_access_bits, access, key, ULONG_MAX) {
++	       for (i = folio_index(folio); i < folio_index(folio) + folio_nr_pages(folio); i++) {
++		   pg_idx = i / sizeof(unsigned long);
+ 
+ 		   xa_lock_irq(&access->bits_arr);
+ 
+-           xa_lock_irq(bits_arr);
+-
+-           val = xa_load(bits_arr, pg_idx);
+-           if (val == NULL)
+-               goto unlock_cont;
+-
+-           bitfield = xa_to_value(val);
+-           old = bitfield;
+-           bitfield &= ~(1 << (i % sizeof(unsigned long)));
+-
+-           __xa_store(bits_arr, pg_idx, xa_mk_value(bitfield), GFP_KERNEL);
+-
++		   val = xa_load(&access->bits_arr, pg_idx);
++		   if (val == NULL)
++		       goto unlock_cont;
+ 
+-           pr_debug("mapping_clear_accessed_bits:     bfi=%lx: %lx -> %lx", pg_idx, old, bitfield);
++		   bitfield = xa_to_value(val);
++		   old = bitfield;
++		   bitfield &= ~(1 << (i % sizeof(unsigned long)));
+ 
+ 		   __xa_store(&access->bits_arr, pg_idx, xa_mk_value(bitfield), GFP_KERNEL);
+ unlock_cont:
+-           xa_unlock_irq(bits_arr);
++		   xa_unlock_irq(&access->bits_arr);
+        }
+    }
+ }
+@@ -177,7 +174,7 @@ static int filemap_get_access_bitmask(struct address_space *mapping,
+ {
+ 	int ret;
+ 	unsigned long key;
+-	struct xarray* bits_arr;
++	struct access_bits_struct *access;
+ 
+ 	*out = NULL;
+ 
+@@ -185,27 +182,41 @@ static int filemap_get_access_bitmask(struct address_space *mapping,
+ 
+ 	// Try to acquire the xarray based on the mm
+ retry:
+-	bits_arr = mtree_load(&mapping->i_mm_access_bits, key);
+-	if (!bits_arr) {
++	access = mtree_load(&mapping->i_mm_access_bits, key);
++	if (!access) {
+ 		// TODO: slab cache
+-		bits_arr = kzalloc(sizeof(struct xarray), GFP_KERNEL);
+-		if (!bits_arr)
++		access = kzalloc(sizeof(struct access_bits_struct), GFP_KERNEL);
++		if (!access)
+ 			return -ENOMEM;
+ 
+-		xa_init_flags(bits_arr, XA_FLAGS_LOCK_IRQ);
++		xa_init_flags(&access->bits_arr, XA_FLAGS_LOCK_IRQ);
++		access->mm_token = (mm ? mm->filemap_token : 0);
+ 
+-		ret = mtree_insert(&mapping->i_mm_access_bits, key, bits_arr, GFP_KERNEL);
++		ret = mtree_insert(&mapping->i_mm_access_bits, key, access, GFP_KERNEL);
+ 		if (ret == -EEXIST) {
+-			kfree(bits_arr);
++			kfree(access);
+ 			goto retry;
+ 		}
+ 		if (ret) {
+-			kfree(bits_arr);
++			kfree(access);
+ 			return ret;
+ 		}
++	} else if (mm && access) {
++
++		if (access->mm_token != mm->filemap_token) {
++			// Check if the mm token matches - otherwise it has been
++			// recycled and should be treated like new
++
++			// TODO: Clear elements instead of reinit - probably not threadsafe
++			// Or use mutex for struct but remove from xarr
++			xa_destroy(&access->bits_arr);
++			xa_init(&access->bits_arr);
++
++			access->mm_token = (mm ? mm->filemap_token : 0);
++		}
+ 	}
+ 
+-	*out = bits_arr;
++	*out = &access->bits_arr;
+ 	return 0;
+ }
+ 
+-- 
+2.55.0
+
