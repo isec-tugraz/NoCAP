@@ -1,4 +1,4 @@
-# A Practical Defense Against Page Cache Attacks -- NoCAP
+# NoCAP: Practically Defending Page Cache Attacks
 
 This repository contains the source code, kernel patches, and evaluation scripts
 for the paper introducing NoCAP, a kernel-level defense against page cache
